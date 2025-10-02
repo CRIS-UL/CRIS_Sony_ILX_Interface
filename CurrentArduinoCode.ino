@@ -12,7 +12,7 @@ SoftwareSerial RS485Serial(RS485_RX, RS485_TX);  // RX, TX
 // ---------- Ethernet (ENC28J60) ----------
 const uint8_t ENC28J60_CS = 10;  // D10 = CS (SPI uses D11/D12/D13)
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip(192, 168, 3, 70);
+IPAddress ip(192, 168, 2, 70);
 IPAddress dnsServer(192, 168, 2, 1);
 IPAddress gateway(192, 168, 2, 1);
 IPAddress subnet(255, 255, 255, 0);
@@ -21,32 +21,37 @@ const uint16_t PORT = 9000;
 EthernetServer server(PORT);
 
 // ---------- State ----------
-uint8_t strobeIntensity = 0;
-uint8_t lampIntensity   = 0;
+uint8_t strobeIntensity = 0;  // 0..100
+uint8_t lampIntensity   = 0;  // 0..100
 bool lampOn = false;
 
-// ---------- Exposure Counter ----------
-const int exposurePin = 7;
-volatile unsigned long exposureCount = 0;
-volatile bool exposureCounting = false; // controlled from GUI
+// ====== Camera Focus + Trigger ======
+const int cameraFocusPin   = 5; // FOCUS line (free)
+const int cameraTriggerPin = 6; // TRIGGER line
 
-void exposureISR() {
-  if (exposureCounting) {
-    exposureCount++;
+// Pull FOCUS low, then TRIGGER low, hold for press_us using micros(), then release TRIGGER then FOCUS (to HIGH-Z).
+void cameraTrigger_us(unsigned long press_us) {
+  // Engage focus + trigger
+  pinMode(cameraFocusPin, OUTPUT);
+  digitalWrite(cameraFocusPin, LOW);
+
+  pinMode(cameraTriggerPin, OUTPUT);
+  digitalWrite(cameraTriggerPin, LOW);
+
+  // Measure hold time *after* both are low
+  unsigned long t0 = micros();
+  while ((unsigned long)(micros() - t0) < press_us) {
+    // busy-wait; press duration accurate to a few µs (AVR ISR jitter aside)
   }
+
+  // Release trigger then focus (open switch behavior)
+  pinMode(cameraTriggerPin, INPUT); // high-Z
+  pinMode(cameraFocusPin,  INPUT);  // high-Z
 }
 
-void resetExposureCount() {
-  noInterrupts();
-  exposureCount = 0;
-  interrupts();
-}
-
-unsigned long getExposureCount() {
-  noInterrupts();
-  unsigned long val = exposureCount;
-  interrupts();
-  return val;
+// Millisecond wrapper (maintains your existing API)
+void cameraTrigger(unsigned long press_ms = 1000) {
+  cameraTrigger_us(press_ms * 1000UL);
 }
 
 // ---------- Forward decl ----------
@@ -59,10 +64,10 @@ void sendLine(EthernetClient &c, const char *s) {
   c.write('\n');
 }
 
+// Forward any line beginning with '~' over RS-485.
 bool maybe_forward_rs485(const String &cmd, EthernetClient &client) {
   if (cmd.length() && (cmd.charAt(0) == '~' || cmd.charAt(0) == '$')) {
     rs485_send_line(cmd);
-    Serial.print(F("[FWD RS485] ")); Serial.println(cmd);
     sendLine(client, "OK FORWARDED");
     return true;
   }
@@ -71,10 +76,10 @@ bool maybe_forward_rs485(const String &cmd, EthernetClient &client) {
 
 // ===== RS-485 MONITOR =====
 void rs485_poll(EthernetClient *client) {
-  static char buf[160];
+  static char    buf[160];
   static uint8_t idx = 0;
   static uint32_t lastByteMs = 0;
-  const uint16_t idleFlushMs = 30;
+  const uint16_t idleFlushMs = 30;  // flush partial line after 30ms idle
 
   while (RS485Serial.available()) {
     int b = RS485Serial.read();
@@ -86,7 +91,6 @@ void rs485_poll(EthernetClient *client) {
     if (ch == '\r' || ch == '\n') {
       if (idx > 0) {
         buf[idx] = '\0';
-        Serial.print(F("[RS485<-] ")); Serial.println(buf);
         if (client && client->connected()) {
           String out = String("RS485: ") + buf;
           sendLine(*client, out.c_str());
@@ -100,7 +104,6 @@ void rs485_poll(EthernetClient *client) {
       buf[idx++] = ch;
     } else {
       buf[idx] = '\0';
-      Serial.print(F("[RS485<-] ")); Serial.println(buf);
       if (client && client->connected()) {
         String out = String("RS485: ") + buf;
         sendLine(*client, out.c_str());
@@ -111,7 +114,6 @@ void rs485_poll(EthernetClient *client) {
 
   if (idx > 0 && (millis() - lastByteMs) > idleFlushMs) {
     buf[idx] = '\0';
-    Serial.print(F("[RS485<-] ")); Serial.println(buf);
     if (client && client->connected()) {
       String out = String("RS485: ") + buf;
       sendLine(*client, out.c_str());
@@ -127,33 +129,32 @@ void handleCommand(const String &line, EthernetClient &client) {
 
   if (maybe_forward_rs485(cmd, client)) return;
 
-  // ---------- Exposure commands ----------
-  if (cmd.equalsIgnoreCase("START_EXPOSURE_COUNT")) {
-    resetExposureCount();
-    exposureCounting = true;
-    sendLine(client, "OK EXPOSURE COUNT STARTED");
+  // ====== Trigger commands (FOCUS+TRIGGER with micros) ======
+  if (cmd.equalsIgnoreCase("TRIGGER")) {
+    cameraTrigger(1000); // 1s
+    sendLine(client, "OK TRIGGERED");
+    return;
+  }
+  if (cmd.startsWith("TRIGGER_MS")) {
+    int sep = cmd.indexOf(' ');
+    if (sep > 0) {
+      long ms = cmd.substring(sep + 1).toInt();
+      if (ms > 0 && ms <= 10000) {
+        cameraTrigger_us((unsigned long)ms * 1000UL);  // micros-accurate hold
+        sendLine(client, "OK TRIGGERED");
+      } else {
+        sendLine(client, "ERR TRIGGER_MS OUT OF RANGE (1..10000)");
+      }
+    } else {
+      sendLine(client, "ERR TRIGGER_MS NEEDS VALUE");
+    }
     return;
   }
 
-  if (cmd.equalsIgnoreCase("STOP_EXPOSURE_COUNT")) {
-    exposureCounting = false;
-    sendLine(client, "OK EXPOSURE COUNT STOPPED");
-    return;
-  }
-
-  if (cmd.equalsIgnoreCase("GET_EXPOSURE_COUNT")) {
-    unsigned long val = getExposureCount();
-    char buf[40];
-    sprintf(buf, "EXPOSURE_COUNT %lu", val);
-    sendLine(client, buf);
-    return;
-  }
-
-  // ---------- Existing commands ----------
+  // ----- Other commands (unchanged) -----
   if (cmd.equalsIgnoreCase("LAMP OFF")) {
     String data = "~device set lamp:000|SUBC24991";
     rs485_send_line(data);
-    lampOn = false;
     sendLine(client, "OK LAMP OFF");
     return;
   }
@@ -163,14 +164,16 @@ void handleCommand(const String &line, EthernetClient &client) {
     if (sep > 0) {
       int v = cmd.substring(sep + 1).toInt();
       if (v >= 0 && v <= 100) {
-        strobeIntensity = (uint8_t)v;
         char buf[50];
-        sprintf(buf, "~device set strobe:%03d|SUBC24991", strobeIntensity);
-        rs485_send_line(buf);
+        sprintf(buf, "~device set strobe:%03d|SUBC24991", v);
+        rs485_send_line(String(buf));
+        strobeIntensity = (uint8_t)v;
         sendLine(client, "OK STROBE_INTENSITY");
       } else {
-        sendLine(client, "ERR STROBE_INTENSITY OUT OF RANGE");
+        sendLine(client, "ERR STROBE_INTENSITY OUT OF RANGE (0-100)");
       }
+    } else {
+      sendLine(client, "ERR STROBE_INTENSITY NEEDS VALUE");
     }
     return;
   }
@@ -180,14 +183,16 @@ void handleCommand(const String &line, EthernetClient &client) {
     if (sep > 0) {
       int v = cmd.substring(sep + 1).toInt();
       if (v >= 0 && v <= 100) {
-        lampIntensity = (uint8_t)v;
         char buf[50];
-        sprintf(buf, "~device set lamp:%03d|SUBC24991", lampIntensity);
-        rs485_send_line(buf);
+        sprintf(buf, "~device set lamp:%03d|SUBC24991", v);
+        rs485_send_line(String(buf));
+        lampIntensity = (uint8_t)v;
         sendLine(client, "OK LAMP_INTENSITY");
       } else {
-        sendLine(client, "ERR LAMP_INTENSITY OUT OF RANGE");
+        sendLine(client, "ERR LAMP_INTENSITY OUT OF RANGE (0-100)");
       }
+    } else {
+      sendLine(client, "ERR LAMP_INTENSITY NEEDS VALUE");
     }
     return;
   }
@@ -218,25 +223,28 @@ void rs485_send_line(const String &s) {
 void setup() {
   Serial.begin(9600);
 
-  // RS-485
+  // RS-485 setup
   RS485Serial.begin(9600);
   pinMode(DE, OUTPUT);
   pinMode(RE, OUTPUT);
   digitalWrite(DE, LOW);
   digitalWrite(RE, LOW);
 
-  // Ethernet
+  // Ethernet setup
   pinMode(ENC28J60_CS, OUTPUT);
   digitalWrite(ENC28J60_CS, HIGH);
   Ethernet.init(ENC28J60_CS);
   Ethernet.begin(mac, ip, dnsServer, gateway, subnet);
   server.begin();
 
-  // Exposure counter
-  pinMode(exposurePin, INPUT);
-  attachInterrupt(digitalPinToInterrupt(exposurePin), exposureISR, RISING);
+  Serial.print(F("IP: "));      Serial.println(Ethernet.localIP());
+  Serial.print(F("TCP server listening on port ")); Serial.println(PORT);
+  Serial.println(F("Commands: ~... | LAMP OFF | STROBE_INTENSITY <0..100> | LAMP_INTENSITY <0..100> | STATUS"));
+  Serial.println(F("          TRIGGER | TRIGGER_MS <ms> (FOCUS precedes TRIGGER; micros-accurate hold)"));
 
-  Serial.print(F("IP: ")); Serial.println(Ethernet.localIP());
+  // Ensure camera lines idle high-Z
+  pinMode(cameraFocusPin, INPUT);
+  pinMode(cameraTriggerPin, INPUT);
 }
 
 void loop() {
@@ -258,6 +266,5 @@ void loop() {
     }
     rs485_poll(&client);
   }
-
   client.stop();
 }
