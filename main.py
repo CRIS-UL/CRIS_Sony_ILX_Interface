@@ -31,7 +31,8 @@ DEFAULT_IMAGE_DIR = r"C:\Users\Luke Griffin\OneDrive\Desktop\Sony_SDK\build\Rele
 # how long we allow between an exposure and its matching image (seconds)
 MATCH_TOLERANCE_SEC = 2.0
 
-IMAGE_PATTERN = re.compile(r"^DSC\d{1,}\.(jpg)$", re.IGNORECASE)
+# Match DSCXXXXX.JPG and capture the number as group(1)
+IMAGE_PATTERN = re.compile(r"^DSC(\d+)\.(jpg)$", re.IGNORECASE)
 
 # >>> Path to your compiled Sony SDK C++ executable
 CAMERA_APP_EXE = r"C:\Users\Luke Griffin\OneDrive\Desktop\Sony_SDK\build\Release\RemoteCli.exe"
@@ -89,7 +90,7 @@ class TcpClient:
             pass
         self.sock = s
         self.alive = True
-        self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+        self.rx_thread = threading.Thread(target=self._rx_loop, daemon=True, name="TCP-RX")
         self.rx_thread.start()
 
     def _rx_loop(self):
@@ -141,34 +142,29 @@ class App(tk.Tk):
         self.title("Strobe / Lamp Controller (TCP) Aquorea Mk3")
         self.geometry("1100x800")
 
+        # --- set up a log file in place of text boxes ---
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.run_log_path = f"session_log_{ts}.txt"
+
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
 
-        # # Connection + Lamp/Status row (buttons beside connect/disconnect)
+        # Connection row (hidden controls kept as vars)
         row = ttk.Frame(root); row.pack(fill="x", pady=4)
-        ttk.Label(row, text="IP:").pack(side="left")
+
         self.ip_var = tk.StringVar(value=DEFAULT_HOST)
-        ttk.Entry(row, textvariable=self.ip_var, width=18).pack(side="left", padx=5)
-        ttk.Label(row, text="Port:").pack(side="left")
         self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
-        ttk.Entry(row, textvariable=self.port_var, width=8).pack(side="left", padx=5)
-        ttk.Button(row, text="Connect", command=self.on_connect).pack(side="left", padx=6)
-        ttk.Button(row, text="Disconnect", command=self.on_disconnect).pack(side="left")
+
+        # (Hidden per request)
+        # ttk.Label(row, text="IP:").pack(side="left")
+        # ttk.Entry(row, textvariable=self.ip_var, width=18).pack(side="left", padx=5)
+        # ttk.Label(row, text="Port:").pack(side="left")
+        # ttk.Entry(row, textvariable=self.port_var, width=8).pack(side="left", padx=5)
+        # ttk.Button(row, text="Connect", command=self.on_connect).pack(side="left", padx=6)
+        # ttk.Button(row, text="Disconnect", command=self.on_disconnect).pack(side="left")
+        # ttk.Button(row, text="Status",   command=lambda: self.send_cmd("STATUS")).pack(side="left", padx=5)
+
         ttk.Separator(row, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
-        ttk.Button(row, text="Lamp OFF", command=lambda: self.send_cmd("LAMP OFF")).pack(side="left", padx=5)
-        ttk.Button(row, text="Status",   command=lambda: self.send_cmd("STATUS")).pack(side="left", padx=5)
-
-        # Right side: Show Camera GUI beside Open Manual
-        self.btn_gui = tk.Button(row, text="Show Camera GUI", command=self.restart_camera_with_gui, width=22)
-        self.btn_gui.pack(side="right", padx=6)
-        ttk.Button(row, text="Open Manual (PDF)", command=self.open_manual).pack(side="right")
-
-        # Image folder picker
-        img_row = ttk.Frame(root); img_row.pack(fill="x", pady=4)
-        ttk.Label(img_row, text="Image folder:").pack(side="left")
-        self.image_dir_var = tk.StringVar(value=DEFAULT_IMAGE_DIR)
-        ttk.Entry(img_row, textvariable=self.image_dir_var, width=60).pack(side="left", padx=5)
-        ttk.Button(img_row, text="Browse…", command=self.browse_image_dir).pack(side="left")
 
         # Sliders
         sliders = ttk.LabelFrame(root, text="Intensities")
@@ -193,24 +189,11 @@ class App(tk.Tk):
         # Camera Trigger controls
         trig_ctrl = ttk.LabelFrame(root, text="Camera Trigger")
         trig_ctrl.pack(fill="x", pady=10)
-        ttk.Button(trig_ctrl, text="Trigger (1s)",
+        ttk.Button(trig_ctrl, text="Single Trigger",
                    command=lambda: self.send_cmd("TRIGGER")).pack(side="left", padx=5)
-        ttk.Label(trig_ctrl, text="Hold (ms):").pack(side="left", padx=(20,5))
-        self.trig_time_var = tk.StringVar(value="5")  # default 5 ms
-        ttk.Entry(trig_ctrl, textvariable=self.trig_time_var, width=8).pack(side="left")
 
-        def send_custom_trigger():
-            try:
-                ms = int(self.trig_time_var.get())
-                if ms <= 0:
-                    raise ValueError
-                self.send_cmd(f"TRIGGER_MS {ms}")
-            except Exception:
-                messagebox.showerror("Invalid Input", "Please enter a positive integer (ms).")
-
-        ttk.Button(trig_ctrl, text="Trigger (custom)", command=send_custom_trigger).pack(side="left", padx=5)
-        ttk.Label(trig_ctrl, text="Interval (ms):").pack(side="left", padx=(20,5))
-        self.trig_interval_var = tk.StringVar(value="1000")  # default 1000 ms between shots
+        self.trig_time_var = tk.StringVar(value="5")      # default 5 ms
+        self.trig_interval_var = tk.StringVar(value="1000")  # default 1000 ms
         ttk.Entry(trig_ctrl, textvariable=self.trig_interval_var, width=8).pack(side="left")
 
         self.loop_running = False
@@ -225,36 +208,27 @@ class App(tk.Tk):
         self.loop_btn = tk.Button(trig_ctrl, text="Start Loop", command=toggle_loop)
         self.loop_btn.pack(side="left", padx=10)
 
-        # # Custom command (RAW — exact text)
-        # cust = ttk.Frame(root); cust.pack(fill="x", pady=8)
-        # ttk.Label(cust, text="Custom:").pack(side="left")
-        # self.cmd_var = tk.StringVar(value="~COMMAND|SUBC24991")
-        # e = ttk.Entry(cust, textvariable=self.cmd_var)
-        # e.pack(side="left", fill="x", expand=True, padx=6)
-        # e.bind("<Return>", lambda _: self.send_raw())
-        # ttk.Button(cust, text="Send", command=self.send_raw).pack(side="left")
+        # --- Buttons beside Start Loop ---
+        ttk.Button(trig_ctrl, text="Lamp OFF",
+                   command=lambda: self.send_cmd("LAMP OFF")).pack(side="left", padx=6)
 
-        # Two text boxes: Log (left) and Received (right) — smaller so Live View is larger
-        views = ttk.Frame(root); views.pack(fill="x", pady=8)  # no expand=True
-        log_frame = ttk.LabelFrame(views, text="Log")
-        log_frame.pack(side="left", fill="both", expand=False, padx=(0,6))
-        self.log = tk.Text(log_frame, height=2, state="disabled", wrap="word")
-        self.log.pack(fill="both", expand=False)
-        log_btns = ttk.Frame(log_frame); log_btns.pack(fill="x")
-        ttk.Button(log_btns, text="Clear log", command=self.clear_log).pack(side="right", padx=4, pady=4)
+        ttk.Button(trig_ctrl, text="Open Manual (PDF)",
+                   command=self.open_manual).pack(side="left", padx=6)
 
-        rx_frame = ttk.LabelFrame(views, text="Received data Strobe")
-        rx_frame.pack(side="left", fill="both", expand=False, padx=(6,0))
-        self.rx = tk.Text(rx_frame, height=2, state="disabled", wrap="word")
-        self.rx.pack(fill="both", expand=False)
-        rx_btns = ttk.Frame(rx_frame); rx_btns.pack(fill="x")
-        ttk.Button(rx_btns, text="Clear received", command=self.clear_rx).pack(side="right", padx=4, pady=4)
+        self.btn_gui = tk.Button(trig_ctrl, text="Show Camera GUI",
+                                 command=self.restart_camera_with_gui, width=22)
+        self.btn_gui.pack(side="left", padx=6)
+
+        # NEW: Show Latest Image (red/green toggle like GUI)
+        self.btn_latest = tk.Button(trig_ctrl, text="Show Latest Image",
+                                    command=self.toggle_latest_window, width=22)
+        self.btn_latest.pack(side="left", padx=6)
+        # ---------------------------------------------------
 
         # --- Live View panel (dominates remaining space) ---
         live_frame = ttk.LabelFrame(root, text="Live View (1024×680 aspect)")
         live_frame.pack(fill="both", expand=True, pady=8)
 
-        # Use GRID inside live_frame so buttons/altimeter always show under the image
         live_frame.rowconfigure(0, weight=1)   # image row expands
         live_frame.rowconfigure(1, weight=0)   # controls row fixed
         live_frame.rowconfigure(2, weight=0)   # altimeter row
@@ -271,14 +245,12 @@ class App(tk.Tk):
             controls.columnconfigure(i, weight=0)
         controls.columnconfigure(4, weight=1)  # spacer
 
-        # tk.Button (not ttk) so background colors work
         self.btn_headless = tk.Button(
             controls, text="Live View (Headless)",
             command=self.restart_camera_headless, width=22
         )
         self.btn_headless.grid(row=0, column=0, padx=6, pady=4, sticky="w")
 
-        # Arduino status/retry button
         self.btn_arduino = tk.Button(
             controls, text="Arduino: Retry Connect",
             command=self.retry_arduino_connect, width=22
@@ -287,16 +259,12 @@ class App(tk.Tk):
 
         ttk.Label(controls, text="").grid(row=0, column=4, sticky="ew")  # spacer
 
-        # existing:
         controls = ttk.Frame(live_frame)
         controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-
-        # update column config to make room for the new button
         for i in range(5):
             controls.columnconfigure(i, weight=0)
         controls.columnconfigure(5, weight=1)  # spacer moved right
 
-        # existing buttons:
         self.btn_headless = tk.Button(
             controls, text="Live View (Headless)",
             command=self.restart_camera_headless, width=22
@@ -309,17 +277,16 @@ class App(tk.Tk):
         )
         self.btn_arduino.grid(row=0, column=1, padx=6, pady=4, sticky="w")
 
-        # NEW: Altimeter retry/status button
+        # Altimeter button
         self.btn_altimeter = tk.Button(
             controls, text="Altimeter: Retry Connect",
             command=self.retry_altimeter_connect, width=22
         )
         self.btn_altimeter.grid(row=0, column=2, padx=6, pady=4, sticky="w")
 
-        # spacer (move to column 5 now)
         ttk.Label(controls, text="").grid(row=0, column=5, sticky="ew")
 
-        # --- Altimeter readout label under controls ---
+        # --- Altimeter readout label ---
         self.alt_label = ttk.Label(live_frame, text="Altimeter: --.– m (––% confidence)")
         self.alt_label.grid(row=2, column=0, sticky="w", padx=8, pady=(6, 8))
 
@@ -334,6 +301,17 @@ class App(tk.Tk):
         self._camera_lock = threading.Lock()
         self.camera_mode = None  # "headless", "gui", or None
         self._camera_status_job = None
+        self._camera_reader_thread = None
+
+        # NEW: Latest Image window state
+        self.latest_win = None
+        self._latest_label = None
+        self._latest_job = None
+        self._latest_tk = None
+        self._latest_img_pil = None
+        self._last_latest_name = None
+        self._last_latest_mtime = None
+        self._latest_poll_ms = 300  # adjust if needed
 
         # Kick off periodic refresh & handle resize events
         self.start_liveview()
@@ -372,6 +350,13 @@ class App(tk.Tk):
         # --- Start Altimeter on boot ---
         self.start_altimeter()
 
+        # Let the user know where logs are going
+        self.append_log(f"[INFO] Writing logs to: {os.path.abspath(self.run_log_path)}")
+
+        # Initialize GUI button colors/states
+        self._refresh_camera_buttons()
+        self._refresh_latest_button()
+
     # ---------- Manual open ----------
     def open_manual(self):
         path = resource_path(MANUAL_FILENAME)
@@ -392,22 +377,62 @@ class App(tk.Tk):
         """
         with self._camera_lock:
             try:
+                # Start process with stdout/stderr piped so we can log them
                 args = [CAMERA_APP_EXE] if headless else [CAMERA_APP_EXE, "1"]
-                # Suppress stdout/stderr so we don't spam the Log pane
                 proc = subprocess.Popen(
                     args,
                     cwd=os.path.dirname(CAMERA_APP_EXE),
-                    stdout=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True
+                    text=True,
+                    bufsize=1  # line-buffered (best-effort on Windows)
                 )
                 self.camera_proc = proc
                 self.camera_mode = "headless" if headless else "gui"
+                self.append_log(f"[RemoteCLI] Launched: {' '.join(args)}")
+
+                # Start/replace reader thread
+                self._start_camera_reader(proc)
             except Exception as e:
                 messagebox.showerror("Launch failed", f"Could not start camera app:\n{e}")
+                self.append_log(f"[RemoteCLI] Launch failed: {e}")
                 self.camera_proc = None
                 self.camera_mode = None
         self._refresh_camera_buttons()
+
+    def _start_camera_reader(self, proc: subprocess.Popen):
+        # Stop previous reader if any (it should end when proc exits, but be safe)
+        try:
+            if self._camera_reader_thread and self._camera_reader_thread.is_alive():
+                # We can't forcibly kill the thread; it'll end once proc stdout closes
+                pass
+        except Exception:
+            pass
+
+        def _reader():
+            try:
+                if proc.stdout is None:
+                    return
+                # Iterate lines; handle cases where buffering is odd on Windows
+                for line in proc.stdout:
+                    line = line.rstrip("\r\n")
+                    if line:
+                        self.append_log(f"[RemoteCLI] {line}")
+                # drain any remaining
+                rest = proc.stdout.read()
+                if rest:
+                    for ln in rest.splitlines():
+                        self.append_log(f"[RemoteCLI] {ln}")
+            except Exception as e:
+                self.append_log(f"[RemoteCLI] [reader error] {e}")
+            finally:
+                # Ensure mode reflects actual running state
+                if proc.poll() is not None and self.camera_proc is proc:
+                    self.camera_mode = None
+                    self._refresh_camera_buttons()
+
+        self._camera_reader_thread = threading.Thread(target=_reader, daemon=True, name="RemoteCLI-Reader")
+        self._camera_reader_thread.start()
 
     def _write_stop_file(self):
         try:
@@ -437,7 +462,7 @@ class App(tk.Tk):
                     time.sleep(0.1)
             self._remove_stop_file()
             self.start_camera(headless=True)
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="RestartHeadless").start()
 
     def restart_camera_with_gui(self):
         """Stop current instance via stop.txt, then start with arg=1 (GUI)."""
@@ -453,7 +478,7 @@ class App(tk.Tk):
                     time.sleep(0.1)
             self._remove_stop_file()
             self.start_camera(headless=False)
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="RestartGUI").start()
 
     def _schedule_camera_status_poll(self):
         self._poll_camera_status()
@@ -485,6 +510,164 @@ class App(tk.Tk):
         set_btn(self.btn_headless, active=(mode == "headless"))
         set_btn(self.btn_gui,      active=(mode == "gui"))
 
+    # ---------- NEW: Latest Image popup ----------
+    def toggle_latest_window(self):
+        if self.latest_win and tk.Toplevel.winfo_exists(self.latest_win):
+            # close it
+            self._close_latest_window()
+        else:
+            self._open_latest_window()
+
+    def _open_latest_window(self):
+        if self.latest_win and tk.Toplevel.winfo_exists(self.latest_win):
+            return
+        self.latest_win = tk.Toplevel(self)
+        self.latest_win.title("Latest Image")
+        self.latest_win.geometry("900x600")
+        self.latest_win.protocol("WM_DELETE_WINDOW", self._close_latest_window)
+
+        container = ttk.Frame(self.latest_win)
+        container.pack(fill="both", expand=True)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        self._latest_label = tk.Label(container, anchor="center", bg="#101010")
+        self._latest_label.grid(row=0, column=0, sticky="nsew")
+
+        # bind resize to re-render cached image to the new size
+        self.latest_win.bind("<Configure>", self._on_latest_resize)
+
+        # reset state
+        self._latest_img_pil = None
+        self._latest_tk = None
+        self._last_latest_name = None
+        self._last_latest_mtime = None
+
+        self._refresh_latest_button()
+        self._schedule_latest_poll()
+
+    def _close_latest_window(self):
+        try:
+            if self._latest_job is not None:
+                self.after_cancel(self._latest_job)
+        except Exception:
+            pass
+        self._latest_job = None
+
+        try:
+            if self.latest_win and tk.Toplevel.winfo_exists(self.latest_win):
+                self.latest_win.destroy()
+        except Exception:
+            pass
+        self.latest_win = None
+        self._latest_label = None
+        self._latest_img_pil = None
+        self._latest_tk = None
+        self._last_latest_name = None
+        self._last_latest_mtime = None
+        self._refresh_latest_button()
+
+    def _refresh_latest_button(self):
+        open_ = bool(self.latest_win and tk.Toplevel.winfo_exists(self.latest_win))
+        try:
+            if open_:
+                self.btn_latest.config(text="Latest Image: Open", state="disabled",
+                                       bg="#2e7d32", fg="white", activebackground="#2e7d32")
+            else:
+                self.btn_latest.config(text="Show Latest Image", state="normal",
+                                       bg="#b71c1c", fg="white", activebackground="#b71c1c")
+        except Exception:
+            # fallback if classic colors not supported
+            self.btn_latest.config(state=("disabled" if open_ else "normal"))
+
+    def _schedule_latest_poll(self):
+        self._poll_latest_once()
+        self._latest_job = self.after(self._latest_poll_ms, self._schedule_latest_poll)
+
+    def _poll_latest_once(self):
+        if not (self.latest_win and tk.Toplevel.winfo_exists(self.latest_win)):
+            return
+        folder = Path(DEFAULT_IMAGE_DIR)
+        try:
+            newest = self._find_newest_image(folder)
+        except Exception as e:
+            newest = None
+            # Optional: could log error
+        if newest is None:
+            # show waiting text
+            if self._latest_label:
+                self._latest_label.config(text=f"No DSC*.JPG found in:\n{folder}")
+            return
+
+        name, path, mtime = newest
+        if (name != self._last_latest_name) or (mtime != self._last_latest_mtime):
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                img = Image.open(BytesIO(data))
+                img.load()
+                self._latest_img_pil = img
+                self._last_latest_name = name
+                self._last_latest_mtime = mtime
+                self._render_latest_cached()
+            except Exception:
+                # ignore transient read errors while file is being written
+                pass
+        else:
+            # re-render if window size changed
+            self._render_latest_cached()
+
+    def _find_newest_image(self, folder: Path):
+        """Return (name, full_path, mtime) of the highest-numbered DSCXXXXX.JPG, or None."""
+        if not folder.exists():
+            return None
+        newest = None
+        best_num = -1
+        for p in folder.iterdir():
+            if not p.is_file():
+                continue
+            m = IMAGE_PATTERN.match(p.name)
+            if not m:
+                continue
+            try:
+                num = int(m.group(1))
+            except Exception:
+                continue
+            if num > best_num:
+                try:
+                    st = p.stat()
+                    newest = (p.name, str(p), st.st_mtime)
+                    best_num = num
+                except Exception:
+                    continue
+        return newest
+
+    def _on_latest_resize(self, _evt=None):
+        self._render_latest_cached()
+
+    def _render_latest_cached(self):
+        if not (self.latest_win and tk.Toplevel.winfo_exists(self.latest_win)):
+            return
+        if self._latest_img_pil is None or self._latest_label is None:
+            return
+        try:
+            # compute target size inside the label
+            w = max(1, self._latest_label.winfo_width())
+            h = max(1, self._latest_label.winfo_height())
+            # keep aspect ratio, fit inside label
+            iw, ih = self._latest_img_pil.size
+            if iw <= 0 or ih <= 0:
+                return
+            scale = min(w / iw, h / ih)
+            tw = max(1, int(iw * scale))
+            th = max(1, int(ih * scale))
+            img = self._latest_img_pil.resize((tw, th), Image.BILINEAR)
+            self._latest_tk = ImageTk.PhotoImage(img)
+            self._latest_label.config(image=self._latest_tk, text="")
+        except Exception:
+            pass
+    # -----------------------------------------------
+
     # ---------- Arduino auto-connect & status ----------
     def try_autoconnect_arduino(self):
         """Attempt to connect to the Arduino on startup (non-blocking)."""
@@ -498,7 +681,7 @@ class App(tk.Tk):
                 self.client.connect(host, port)
             except Exception:
                 pass  # ignore on boot; user can retry with the button
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="Arduino-Autoconnect").start()
 
     def retry_arduino_connect(self):
         """Manual retry from the red Arduino button."""
@@ -511,9 +694,10 @@ class App(tk.Tk):
                 return
             try:
                 self.client.connect(host, port)
+                self.append_log(f"[Connected to {host}:{port}]")
             except Exception as e:
                 messagebox.showwarning("Connect failed", str(e))
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=True, name="Arduino-Retry").start()
 
     def _schedule_arduino_status_poll(self):
         self._refresh_arduino_button()
@@ -539,7 +723,6 @@ class App(tk.Tk):
 
     def retry_altimeter_connect(self):
         """Manual retry from the Altimeter button; non-blocking."""
-        # stop any existing altimeter polling
         try:
             self.btn_altimeter.config(state="disabled")
         except Exception:
@@ -554,7 +737,6 @@ class App(tk.Tk):
         self._ping_ok = False
         self.alt_label.config(text="Altimeter: reconnecting…")
         self._refresh_altimeter_button()
-        # reconnect
         self.start_altimeter()
 
     def _refresh_altimeter_button(self):
@@ -579,10 +761,10 @@ class App(tk.Tk):
 
     # ---------- UI helpers ----------
     def browse_image_dir(self):
-        d = filedialog.askdirectory(initialdir=self.image_dir_var.get() or os.getcwd(),
+        d = filedialog.askdirectory(initialdir=DEFAULT_IMAGE_DIR,
                                     title="Select image folder (Sony SDK output)")
         if d:
-            self.image_dir_var.set(d)
+            self.image_dir_var = tk.StringVar(value=d)
 
     def _update_val(self, label, v):
         try:
@@ -590,28 +772,31 @@ class App(tk.Tk):
         except:
             pass
 
+    # ---------- FILE LOGGING (used for all logs incl. RemoteCLI output) ----------
+    def _write_line_to_file(self, line: str):
+        try:
+            with open(self.run_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+        try:
+            print(line)
+        except Exception:
+            pass
+
     def append_log(self, text):
-        # Keep for TCP/CSV/etc. (camera stdout suppressed)
-        self.log.configure(state="normal")
-        self.log.insert("end", text + "\n")
-        self.log.see("end")
-        self.log.configure(state="disabled")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        self._write_line_to_file(f"{ts} {text}")
 
     def clear_log(self):
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+        pass
 
     def append_rx(self, text):
-        self.rx.configure(state="normal")
-        self.rx.insert("end", text + "\n")
-        self.rx.see("end")
-        self.rx.configure(state="disabled")
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        self._write_line_to_file(f"{ts} [RX] {text}")
 
     def clear_rx(self):
-        self.rx.configure(state="normal")
-        self.rx.delete("1.0", "end")
-        self.rx.configure(state="disabled")
+        pass
 
     def _extract_rx_payload(self, line: str):
         if line.startswith("RS485: "):
@@ -732,6 +917,8 @@ class App(tk.Tk):
         self.seen_images.clear()
         self.run_start_time = datetime.datetime.now()
 
+        # Keep DEFAULT_IMAGE_DIR
+        self.image_dir_var = tk.StringVar(value=DEFAULT_IMAGE_DIR)
         self.snapshot_existing_images()
 
         self.polling_active = True
@@ -944,7 +1131,6 @@ class App(tk.Tk):
                 self.ping = None
                 self._refresh_altimeter_button()
                 return
-            # Optional: p.set_speed_of_sound(1450000)  # mm/s
             self.ping = p
             self.alt_label.config(text="Altimeter: connected, reading…")
             self._refresh_altimeter_button()
@@ -978,7 +1164,7 @@ class App(tk.Tk):
         finally:
             self._refresh_altimeter_button()
 
-    # ---------- Connect / Disconnect ----------
+    # ---------- Hidden Connect / Disconnect (still programmatic) ----------
     def on_connect(self):
         host = self.ip_var.get().strip()
         try:
@@ -1033,6 +1219,19 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._liveview_job = None
+
+        # Stop Latest Image poll
+        if self._latest_job is not None:
+            try:
+                self.after_cancel(self._latest_job)
+            except Exception:
+                pass
+            self._latest_job = None
+        if self.latest_win and tk.Toplevel.winfo_exists(self.latest_win):
+            try:
+                self.latest_win.destroy()
+            except Exception:
+                pass
 
         # Stop Altimeter polling
         if self._ping_job is not None:
