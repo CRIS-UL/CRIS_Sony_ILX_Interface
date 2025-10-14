@@ -217,11 +217,7 @@ IMAGE_PATTERN       = r"^DSC(\d+)\.(jpg)$"   # case-insensitive
 A minimal one-file, windowed build that bundles the PDF:
 
 ```powershell
-pip install pyinstaller
-pyinstaller --onefile --windowed ^
-  --name AquoreaGUI ^
-  --add-data "Aquorea Mk3 Manual.pdf;." ^
-  main.py
+pyinstaller --onefile --windowed --name CRIS_Sony_ILX_Interface --icon "app.ico" --add-data="app.ico:." --add-data="Aquorea Mk3 Manual.pdf:." main.py
 ```
 
 > The code uses a `resource_path()` helper for PyInstaller (`sys._MEIPASS`) so bundled files (e.g., the manual) resolve correctly.
