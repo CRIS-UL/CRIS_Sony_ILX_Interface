@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('app.ico', '.'), ('Aquorea Mk3 Manual.pdf', '.')],
+    datas=[('app.ico', '.'), ('StrobeCameraManual.pdf', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

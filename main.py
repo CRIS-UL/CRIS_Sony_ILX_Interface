@@ -25,7 +25,7 @@ DEFAULT_HOST = "192.168.2.70"
 DEFAULT_PORT = 9000
 MANUAL_FILENAME = "StrobeCameraManual.pdf"  # put this PDF next to main.py (or bundle with PyInstaller)
 
-# App icon files (bundle alongside main.py / exe)
+# App icon files (bundle aongside main.py / exe)
 APP_ICON_ICO = "app.ico"      # primary on Windows
 APP_ICON_PNG = "cris_logo.png"      # optional fallback for non-Windows (if available)
 
