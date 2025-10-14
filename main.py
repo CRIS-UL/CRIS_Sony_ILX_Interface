@@ -23,7 +23,7 @@ except Exception:
 # -------------------- Configuration --------------------
 DEFAULT_HOST = "192.168.2.70"
 DEFAULT_PORT = 9000
-MANUAL_FILENAME = "Aquorea Mk3 Manual.pdf"  # put this PDF next to main.py (or bundle with PyInstaller)
+MANUAL_FILENAME = "StrobeCameraManual.pdf"  # put this PDF next to main.py (or bundle with PyInstaller)
 
 # App icon files (bundle alongside main.py / exe)
 APP_ICON_ICO = "app.ico"      # primary on Windows
