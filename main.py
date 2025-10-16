@@ -233,6 +233,8 @@ class App(tk.Tk):
 
         self.loop_btn = tk.Button(trig_ctrl, text="Start Loop", command=toggle_loop, width=16)
         self.loop_btn.pack(side="left", padx=10)
+        ttk.Entry(trig_ctrl, textvariable=self.trig_interval_var, width=8).pack(side="left")
+
 
         ttk.Button(trig_ctrl, text="Lamp OFF",
                    command=lambda: self.send_cmd("LAMP OFF")).pack(side="left", padx=6)
