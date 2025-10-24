@@ -34,7 +34,7 @@ DEFAULT_IMAGE_DIR = r"Release"
 CAMERA_APP_EXE = r"Release\RemoteCli.exe"
 
 # Stop flag file for the external camera app
-STOP_FILE_PATH = os.path.join(os.path.dirname(CAMERA_APP_EXE), "stop.txt")
+STOP_FILE_PATH = os.path.join(r"Release", "stop.txt")
 
 # Live View settings
 LIVEVIEW_PATH = r"Release\LiveView000000.JPG"

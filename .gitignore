@@ -5,3 +5,4 @@ build
 StrobeGUI.spec
 *.txt
 logs/
+*.JPG
