@@ -20,6 +20,29 @@ try:
 except Exception:
     Ping1D = None  # we'll show a helpful message if not installed
 
+# --- Paramiko for Pi SSH ---
+try:
+    import paramiko
+except ImportError:
+    paramiko = None
+
+def get_app_dir() -> Path:
+    """
+    Return the folder beside the executable (frozen) or this script (dev).
+    Use this for files that live next to the exe, not bundled inside it.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
+def resource_path(rel_path: str) -> str:
+    """Return absolute path to resource, works for dev and PyInstaller."""
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, rel_path)
+    return str(get_app_dir() / rel_path)
+
+
 # -------------------- Configuration --------------------
 DEFAULT_HOST = "192.168.2.70"
 DEFAULT_PORT = 9000
@@ -29,15 +52,16 @@ MANUAL_FILENAME = "StrobeCameraManual.pdf"  # put this PDF next to main.py (or b
 APP_ICON_ICO = "app.ico"      # primary on Windows
 APP_ICON_PNG = "cris_logo.png"      # optional fallback for non-Windows (if available)
 
-# Sony SDK paths
-DEFAULT_IMAGE_DIR = r"Release"
-CAMERA_APP_EXE = r"Release\RemoteCli.exe"
+# Sony SDK paths — absolute so the app works when double-clicked from Explorer
+_RELEASE_DIR = get_app_dir() / "Release"
+DEFAULT_IMAGE_DIR = str(_RELEASE_DIR)
+CAMERA_APP_EXE = str(_RELEASE_DIR / "RemoteCli.exe")
 
 # Stop flag file for the external camera app
-STOP_FILE_PATH = os.path.join(r"Release", "stop.txt")
+STOP_FILE_PATH = str(_RELEASE_DIR / "stop.txt")
 
 # Live View settings
-LIVEVIEW_PATH = r"Release\LiveView000000.JPG"
+LIVEVIEW_PATH = str(_RELEASE_DIR / "LiveView000000.JPG")
 LIVEVIEW_REFRESH_MS = 50  # ~20 checks/sec; repaints only on mtime change
 LIVEVIEW_TARGET_W = 1024
 LIVEVIEW_TARGET_H = 680
@@ -51,27 +75,15 @@ PING_UDP_HOST = "192.168.2.2"
 PING_UDP_PORT = 9090
 PING_REFRESH_MS = 100       # how often to poll distance (ms)
 
+# Raspberry Pi SSH settings for exposure logger
+PI_HOST = "192.168.2.2"
+PI_USER = "pi"
+PI_PASS = "raspberry"
+PI_SCRIPT_CMD = "cd ~/navigator_logger && venv/bin/python -u readpin.py"
+
 # Match DSCXXXXX.JPG and capture the number as group(1)
 IMAGE_PATTERN = re.compile(r"^DSC(\d+)\.(jpg)$", re.IGNORECASE)
 # ------------------------------------------------------
-
-
-def get_app_dir() -> Path:
-    """
-    Return a suitable base directory for app data/logs:
-    - When frozen (PyInstaller): the folder beside the executable
-    - Otherwise: the folder containing this script
-    """
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).parent
-
-
-def resource_path(rel_path: str) -> str:
-    """Return absolute path to resource, works for dev and PyInstaller."""
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, rel_path)
-    return str(get_app_dir() / rel_path)
 
 
 def open_file_with_default_app(path: str):
@@ -249,6 +261,35 @@ class App(tk.Tk):
         self.btn_latest = tk.Button(trig_ctrl, text="Show Latest Image",
                                     command=self.toggle_latest_window, width=22)
         self.btn_latest.pack(side="left", padx=6)
+
+        # -------------------- Pi Exposure Logger --------------------
+        pi_frame = ttk.LabelFrame(root, text="Pi Exposure Logger")
+        pi_frame.pack(fill="x", pady=6)
+
+        pi_btn_row = ttk.Frame(pi_frame)
+        pi_btn_row.pack(fill="x", padx=6, pady=4)
+
+        self.pi_btn = tk.Button(pi_btn_row, text="Start Pi Logger",
+                                command=self.toggle_pi_logger, width=18,
+                                bg="#b71c1c", fg="white", activebackground="#b71c1c")
+        self.pi_btn.pack(side="left")
+
+        pi_out_frame = ttk.Frame(pi_frame)
+        pi_out_frame.pack(fill="x", padx=6, pady=(0, 6))
+        pi_scroll = ttk.Scrollbar(pi_out_frame)
+        pi_scroll.pack(side="right", fill="y")
+        self.pi_output = tk.Text(
+            pi_out_frame, height=7, bg="#1a1a1a", fg="#d4f1a0",
+            font=("Consolas", 9), state="disabled", wrap="word",
+            yscrollcommand=pi_scroll.set
+        )
+        self.pi_output.pack(side="left", fill="x", expand=True)
+        pi_scroll.config(command=self.pi_output.yview)
+
+        # Pi logger state
+        self._pi_running = False
+        self._pi_ssh = None
+        self._pi_thread = None
 
         # -------------------- Live View panel --------------------
         live_frame = ttk.LabelFrame(root, text=f"Live View ({LIVEVIEW_TARGET_W}×{LIVEVIEW_TARGET_H} aspect)")
@@ -998,6 +1039,97 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showwarning("Send failed", str(e))
 
+    # ---------- Pi Exposure Logger ----------
+    def toggle_pi_logger(self):
+        if not self._pi_running:
+            self.start_pi_logger()
+        else:
+            self.stop_pi_logger()
+
+    def start_pi_logger(self):
+        if paramiko is None:
+            messagebox.showerror(
+                "Missing library",
+                "paramiko is not installed.\nRun:  pip install paramiko"
+            )
+            return
+        self._pi_running = True
+        self._refresh_pi_button()
+        self._append_pi(f"Connecting to {PI_USER}@{PI_HOST}…\n")
+        self._pi_thread = threading.Thread(
+            target=self._pi_worker,
+            args=(PI_HOST, PI_USER, PI_PASS),
+            daemon=True,
+            name="Pi-Logger"
+        )
+        self._pi_thread.start()
+
+    def _pi_worker(self, host, user, password):
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                host, username=user,
+                password=password if password else None,
+                timeout=10
+            )
+            self._pi_ssh = ssh
+            self._append_pi("Connected. Running readpin.py…\n")
+
+            _stdin, stdout, stderr = ssh.exec_command(PI_SCRIPT_CMD, get_pty=True)
+
+            for line in iter(stdout.readline, ""):
+                if not self._pi_running:
+                    break
+                if line:
+                    self._append_pi(line)
+
+            exit_code = stdout.channel.recv_exit_status()
+            self._append_pi(f"Script exited (code {exit_code}).\n")
+            ssh.close()
+        except Exception as e:
+            self._append_pi(f"Error: {e}\n")
+        finally:
+            self._pi_ssh = None
+            self._pi_running = False
+            self.after(0, self._refresh_pi_button)
+
+    def stop_pi_logger(self):
+        self._pi_running = False
+        if self._pi_ssh:
+            try:
+                self._pi_ssh.close()
+            except Exception:
+                pass
+        self._refresh_pi_button()
+
+    def _append_pi(self, text):
+        def ui():
+            self.pi_output.config(state="normal")
+            self.pi_output.insert("end", text)
+            self.pi_output.see("end")
+            self.pi_output.config(state="disabled")
+        self.after(0, ui)
+        self.append_log(f"[Pi] {text.rstrip()}")
+
+    def _refresh_pi_button(self):
+        if self._pi_running:
+            try:
+                self.pi_btn.config(
+                    text="Stop Pi Logger", state="normal",
+                    bg="#2e7d32", fg="white", activebackground="#2e7d32"
+                )
+            except Exception:
+                self.pi_btn.config(text="Stop Pi Logger")
+        else:
+            try:
+                self.pi_btn.config(
+                    text="Start Pi Logger", state="normal",
+                    bg="#b71c1c", fg="white", activebackground="#b71c1c"
+                )
+            except Exception:
+                self.pi_btn.config(text="Start Pi Logger")
+
     # ---------- Close ----------
     def on_close(self):
         # Signal external executable to stop
@@ -1048,6 +1180,9 @@ class App(tk.Tk):
         # Stop continuous trigger loop if running
         if getattr(self, "loop_running", False):
             self.stop_loop()
+
+        # Stop Pi logger
+        self.stop_pi_logger()
 
         # Close TCP client and exit
         self.client.close()
