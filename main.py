@@ -231,7 +231,7 @@ class App(tk.Tk):
         ttk.Button(trig_ctrl, text="Single Trigger",
                    command=lambda: self.send_cmd("TRIGGER")).pack(side="left", padx=5)
 
-        self.trig_time_var = tk.StringVar(value="5")       # default 5 ms
+        self.trig_time_var = tk.StringVar(value="100")       # default 5 ms
         self.trig_interval_var = tk.StringVar(value="1000")  # default 1000 ms
 
         self.loop_running = False
