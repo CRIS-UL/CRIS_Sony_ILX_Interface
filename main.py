@@ -8,23 +8,30 @@ from tkinter import ttk, messagebox
 import datetime
 import time
 import re
+import math
+import json
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # --- Pillow for JPEG rendering ---
 from PIL import Image, ImageTk
 from io import BytesIO
 
-# --- Blue Robotics Ping1D (altimeter) ---
+# --- pymavlink for direct seabed altitude probing ---
 try:
-    from brping import Ping1D
-except Exception:
-    Ping1D = None  # we'll show a helpful message if not installed
+    from pymavlink import mavutil
+except ImportError:
+    mavutil = None
 
 # --- Paramiko for Pi SSH ---
 try:
     import paramiko
 except ImportError:
     paramiko = None
+
+# Camera focus lead time before the trigger pulse starts
+FOCUS_LEAD_MS = 150
 
 def get_app_dir() -> Path:
     """
@@ -67,19 +74,29 @@ LIVEVIEW_TARGET_W = 1024
 LIVEVIEW_TARGET_H = 680
 LIVEVIEW_ASPECT = LIVEVIEW_TARGET_W / LIVEVIEW_TARGET_H
 
-# Altimeter (Ping1D) connection settings
-PING_CONNECT_MODE = "udp"   # "udp" or "serial"
-PING_SERIAL_PORT = "COM3"   # e.g. "COM3" on Windows or "/dev/ttyUSB0" on Linux
-PING_SERIAL_BAUD = 115200
-PING_UDP_HOST = "192.168.2.2"
-PING_UDP_PORT = 9090
-PING_REFRESH_MS = 100       # how often to poll distance (ms)
+# MAVLink connection for direct seabed altitude probing
+MAVLINK_CONNECTION = 'udpin:0.0.0.0:14552'
+MAVLINK_STREAM_HZ = 20
 
 # Raspberry Pi SSH settings for exposure logger
 PI_HOST = "192.168.2.2"
 PI_USER = "pi"
 PI_PASS = "raspberry"
 PI_SCRIPT_CMD = "cd ~/navigator_logger && venv/bin/python -u readpin.py"
+
+# BlueROV control software HTTP API (topside Flask server; heading + drive + depth live there)
+BLUEROV_API_HOST = "127.0.0.1"
+BLUEROV_API_PORT = 5000
+BLUEROV_YAW_ABS_URL = f"http://{BLUEROV_API_HOST}:{BLUEROV_API_PORT}/api/yaw_abs"
+BLUEROV_SET_VELOCITY_URL = f"http://{BLUEROV_API_HOST}:{BLUEROV_API_PORT}/api/set_velocity"
+BLUEROV_DEPTH_STEP_URL = f"http://{BLUEROV_API_HOST}:{BLUEROV_API_PORT}/api/depth_step"
+BLUEROV_STOP_DEPTH_URL = f"http://{BLUEROV_API_HOST}:{BLUEROV_API_PORT}/api/stop_depth"
+BLUEROV_CLEAR_DEPTH_HOLD_URL = f"http://{BLUEROV_API_HOST}:{BLUEROV_API_PORT}/api/clear_depth_hold"
+BLUEROV_STATUS_URL = f"http://{BLUEROV_API_HOST}:{BLUEROV_API_PORT}/api/status"
+HEADING_SEND_THROTTLE_MS = 120   # matches the BlueROV web UI's own drag throttle
+DEFAULT_DRIVE_SPEED_MPS = 0.5    # default constant forward speed (m/s)
+DEFAULT_DEPTH_STEP_M = 0.5       # default depth nudge per tap (m)
+DEPTH_STATUS_POLL_MS = 1000      # how often to poll current depth for the readout
 
 # Match DSCXXXXX.JPG and capture the number as group(1)
 IMAGE_PATTERN = re.compile(r"^DSC(\d+)\.(jpg)$", re.IGNORECASE)
@@ -94,6 +111,87 @@ def open_file_with_default_app(path: str):
         subprocess.Popen(["open", path])
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def post_json(url: str, payload: dict, timeout: float = 2.0):
+    """POST a JSON body to url and return the parsed response (stdlib only)."""
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+    try:
+        return json.loads(body)
+    except Exception:
+        return body
+
+
+def get_json(url: str, timeout: float = 2.0):
+    """GET url and return the parsed JSON response (stdlib only)."""
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+    return json.loads(body)
+
+
+class HeadingDial(tk.Canvas):
+    """Circular heading wheel: click/drag to pick a heading (0-359 deg)."""
+
+    def __init__(self, master, size=170, on_change=None, **kwargs):
+        kwargs.setdefault("bg", "#101010")
+        kwargs.setdefault("highlightthickness", 0)
+        super().__init__(master, width=size, height=size, **kwargs)
+        self.size = size
+        self.radius = size / 2 - 16
+        self.center = (size / 2, size / 2)
+        self.heading = 0.0
+        self.on_change = on_change
+
+        self.bind("<Button-1>", self._on_pointer)
+        self.bind("<B1-Motion>", self._on_pointer)
+
+        self._draw()
+
+    def _on_pointer(self, event):
+        cx, cy = self.center
+        deg = (math.degrees(math.atan2(event.y - cy, event.x - cx)) + 90) % 360
+        self.set_heading(deg, notify=True)
+
+    def set_heading(self, deg, notify=False):
+        self.heading = float(deg) % 360
+        self._draw()
+        if notify and self.on_change:
+            self.on_change(self.heading)
+
+    def _draw(self):
+        self.delete("all")
+        cx, cy = self.center
+        r = self.radius
+
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                          outline="#555555", width=2, fill="#0d0d0d")
+
+        for deg in range(0, 360, 30):
+            rad = math.radians(deg - 90)
+            x1 = cx + (r - 8) * math.cos(rad)
+            y1 = cy + (r - 8) * math.sin(rad)
+            x2 = cx + r * math.cos(rad)
+            y2 = cy + r * math.sin(rad)
+            self.create_line(x1, y1, x2, y2, fill="#555555")
+
+        for deg, label in ((0, "N"), (90, "E"), (180, "S"), (270, "W")):
+            rad = math.radians(deg - 90)
+            lx = cx + (r + 12) * math.cos(rad)
+            ly = cy + (r + 12) * math.sin(rad)
+            self.create_text(lx, ly, text=label, fill="#d4f1a0",
+                              font=("Segoe UI", 10, "bold"))
+
+        rad = math.radians(self.heading - 90)
+        nx = cx + (r - 6) * math.cos(rad)
+        ny = cy + (r - 6) * math.sin(rad)
+        self.create_line(cx, cy, nx, ny, fill="#e53935", width=3, arrow="last")
+        self.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="#e53935", outline="")
 
 
 class TcpClient:
@@ -262,6 +360,76 @@ class App(tk.Tk):
                                     command=self.toggle_latest_window, width=22)
         self.btn_latest.pack(side="left", padx=6)
 
+        # -------------------- Heading & Drive (BlueROV) --------------------
+        heading_frame = ttk.LabelFrame(root, text="Heading / Drive (BlueROV)")
+        heading_frame.pack(fill="x", pady=10)
+
+        self.heading_dial = HeadingDial(heading_frame, size=150, on_change=self._on_dial_change)
+        self.heading_dial.pack(side="left", padx=10, pady=8)
+
+        heading_ctrl = ttk.Frame(heading_frame)
+        heading_ctrl.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+        hrow = ttk.Frame(heading_ctrl); hrow.pack(fill="x", pady=4)
+        ttk.Label(hrow, text="Heading (deg):").pack(side="left")
+        self.heading_var = tk.StringVar(value="000")
+        self.heading_readout = ttk.Label(hrow, textvariable=self.heading_var, width=5,
+                                          font=("Segoe UI", 11, "bold"))
+        self.heading_readout.pack(side="left", padx=(6, 12))
+
+        self.heading_entry_var = tk.StringVar(value="0")
+        ttk.Entry(hrow, textvariable=self.heading_entry_var, width=6).pack(side="left")
+        ttk.Button(hrow, text="Set Heading",
+                   command=self._apply_heading_entry).pack(side="left", padx=6)
+
+        # Pending/throttle state for dial-drag heading sends
+        self._pending_heading = None
+        self._heading_send_job = None
+
+        drow = ttk.Frame(heading_ctrl); drow.pack(fill="x", pady=(10, 4))
+        ttk.Label(drow, text="Forward speed (m/s):").pack(side="left")
+        self.drive_speed_var = tk.StringVar(value=str(DEFAULT_DRIVE_SPEED_MPS))
+        ttk.Entry(drow, textvariable=self.drive_speed_var, width=6).pack(side="left", padx=(6, 12))
+
+        self.driving_forward = False
+        self.drive_btn = tk.Button(drow, text="Drive Forward",
+                                    command=self._toggle_drive_forward, width=16)
+        self.drive_btn.pack(side="left")
+        self._set_drive_button(False)
+
+        # -------------------- Depth (BlueROV) --------------------
+        depth_frame = ttk.LabelFrame(root, text="Depth (BlueROV)")
+        depth_frame.pack(fill="x", pady=10)
+
+        self.depth_readout_var = tk.StringVar(value="Depth: -- m")
+        ttk.Label(depth_frame, textvariable=self.depth_readout_var, width=16,
+                  font=("Segoe UI", 11, "bold")).pack(side="left", padx=10)
+
+        depth_ctrl = ttk.Frame(depth_frame)
+        depth_ctrl.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+        dtrow = ttk.Frame(depth_ctrl); dtrow.pack(fill="x", pady=4)
+        ttk.Label(dtrow, text="Target depth (m):").pack(side="left")
+        self.depth_target_var = tk.StringVar(value="0.0")
+        ttk.Entry(dtrow, textvariable=self.depth_target_var, width=6).pack(side="left", padx=(6, 12))
+        ttk.Button(dtrow, text="Set Depth", command=self._apply_depth_target).pack(side="left")
+
+        dsrow = ttk.Frame(depth_ctrl); dsrow.pack(fill="x", pady=4)
+        ttk.Label(dsrow, text="Step (m):").pack(side="left")
+        self.depth_step_var = tk.StringVar(value=str(DEFAULT_DEPTH_STEP_M))
+        ttk.Entry(dsrow, textvariable=self.depth_step_var, width=6).pack(side="left", padx=(6, 12))
+        ttk.Button(dsrow, text="▲ Shallower", width=11,
+                   command=lambda: self._nudge_depth(-1)).pack(side="left", padx=2)
+        ttk.Button(dsrow, text="▼ Deeper", width=11,
+                   command=lambda: self._nudge_depth(1)).pack(side="left", padx=2)
+        ttk.Button(dsrow, text="Hold Current Depth",
+                   command=self._hold_current_depth).pack(side="left", padx=(12, 4))
+        ttk.Button(dsrow, text="Release Depth Hold",
+                   command=self._release_depth_hold).pack(side="left", padx=4)
+
+        self._depth_status_job = None
+        self._schedule_depth_status_poll()
+
         # -------------------- Pi Exposure Logger --------------------
         pi_frame = ttk.LabelFrame(root, text="Pi Exposure Logger")
         pi_frame.pack(fill="x", pady=6)
@@ -286,10 +454,19 @@ class App(tk.Tk):
         self.pi_output.pack(side="left", fill="x", expand=True)
         pi_scroll.config(command=self.pi_output.yview)
 
+        self.pi_dvl_label = ttk.Label(pi_frame, text="Seabed alt: -- m")
+        self.pi_dvl_label.pack(anchor="w", padx=8, pady=(0, 6))
+
         # Pi logger state
         self._pi_running = False
         self._pi_ssh = None
         self._pi_thread = None
+
+        # Direct MAVLink seabed altitude state
+        self._mav_thread = None
+        self._mav_running = False
+        self._seabed_alt = None
+        self._seabed_alt_lock = threading.Lock()
 
         # -------------------- Live View panel --------------------
         live_frame = ttk.LabelFrame(root, text=f"Live View ({LIVEVIEW_TARGET_W}×{LIVEVIEW_TARGET_H} aspect)")
@@ -323,17 +500,7 @@ class App(tk.Tk):
         )
         self.btn_arduino.grid(row=0, column=1, padx=6, pady=4, sticky="w")
 
-        self.btn_altimeter = tk.Button(
-            controls, text="Altimeter: Retry Connect",
-            command=self.retry_altimeter_connect, width=22
-        )
-        self.btn_altimeter.grid(row=0, column=2, padx=6, pady=4, sticky="w")
-
         ttk.Label(controls, text="").grid(row=0, column=4, sticky="ew")  # spacer
-
-        # Altimeter readout
-        self.alt_label = ttk.Label(live_frame, text="Altimeter: --.– m (––% confidence)")
-        self.alt_label.grid(row=2, column=0, sticky="w", padx=8, pady=(6, 8))
 
         # Internal liveview state
         self._liveview_job = None
@@ -365,13 +532,8 @@ class App(tk.Tk):
         self.client = TcpClient(self.on_line_received)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Altimeter state
-        self.ping = None
-        self._ping_job = None
-        self._ping_ok = False  # set True after we successfully read data
-
-        # --- Auto-start the camera app on boot (headless: no arguments) ---
-        self.start_camera(headless=True)
+        # Camera app is no longer auto-started; it launches only when the user
+        # presses "Live View (Headless)" or "Show Camera GUI".
 
         # Start periodic camera status poll to color/disable buttons
         self._schedule_camera_status_poll()
@@ -380,8 +542,8 @@ class App(tk.Tk):
         self.try_autoconnect_arduino()
         self._schedule_arduino_status_poll()
 
-        # --- Start Altimeter on boot ---
-        self.start_altimeter()
+        # --- Start direct MAVLink seabed-altitude probe ---
+        self._start_mavlink_probe()
 
         # Let the user know where logs are going
         self.append_log(f"[INFO] Writing logs to: {os.path.abspath(self.run_log_path)}")
@@ -476,6 +638,81 @@ class App(tk.Tk):
 
         self._camera_reader_thread = threading.Thread(target=_reader, daemon=True, name="RemoteCLI-Reader")
         self._camera_reader_thread.start()
+
+    def _start_mavlink_probe(self):
+        if mavutil is None:
+            self._update_seabed_alt_label(None)
+            self.append_log("[MAVLink] pymavlink not installed; direct seabed altitude disabled")
+            return
+        if self._mav_running:
+            return
+        self._mav_running = True
+        self._mav_thread = threading.Thread(
+            target=self._mavlink_probe_loop,
+            daemon=True,
+            name="MAVLink-Probe"
+        )
+        self._mav_thread.start()
+
+    def _stop_mavlink_probe(self):
+        self._mav_running = False
+        if self._mav_thread is not None and self._mav_thread.is_alive():
+            self._mav_thread.join(timeout=1.0)
+        self._mav_thread = None
+
+    def _mavlink_probe_loop(self):
+        conn = None
+        try:
+            self.append_log(f"[MAVLink] Connecting to {MAVLINK_CONNECTION}")
+            conn = mavutil.mavlink_connection(MAVLINK_CONNECTION)
+            heartbeat = conn.wait_heartbeat(timeout=10)
+            if heartbeat is None:
+                raise RuntimeError("No MAVLink heartbeat received")
+            self.append_log(f"[MAVLink] Heartbeat from sys={conn.target_system} comp={conn.target_component}")
+            try:
+                conn.mav.request_data_stream_send(
+                    conn.target_system,
+                    conn.target_component,
+                    mavutil.mavlink.MAV_DATA_STREAM_ALL,
+                    MAVLINK_STREAM_HZ,
+                    1
+                )
+            except Exception:
+                pass
+
+            last_seen = time.time()
+            while self._mav_running:
+                msg = conn.recv_match(type="RANGEFINDER", blocking=True, timeout=2)
+                if not self._mav_running:
+                    break
+                if msg is None:
+                    if time.time() - last_seen > 5.0:
+                        self._update_seabed_alt_label(None)
+                    continue
+                last_seen = time.time()
+                if hasattr(msg, "distance"):
+                    distance = float(msg.distance)
+                    with self._seabed_alt_lock:
+                        self._seabed_alt = distance
+                    self._update_seabed_alt_label(distance)
+        except Exception as e:
+            self.append_log(f"[MAVLink] Error: {e}")
+            self._update_seabed_alt_label(None)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._mav_running = False
+
+    def _update_seabed_alt_label(self, distance):
+        def ui():
+            if distance is None:
+                self.pi_dvl_label.config(text="Seabed alt: -- m")
+            else:
+                self.pi_dvl_label.config(text=f"Seabed alt: {distance:.3f} m")
+        self.after(0, ui)
 
     def _write_stop_file(self):
         try:
@@ -760,95 +997,6 @@ class App(tk.Tk):
         except Exception:
             self.btn_arduino.config(text=text, state=state)
 
-    # ---------- Altimeter ----------
-    def retry_altimeter_connect(self):
-        """Manual retry from the Altimeter button; non-blocking."""
-        try:
-            self.btn_altimeter.config(state="disabled")
-        except Exception:
-            pass
-        if getattr(self, "_ping_job", None) is not None:
-            try:
-                self.after_cancel(self._ping_job)
-            except Exception:
-                pass
-            self._ping_job = None
-        self.ping = None
-        self._ping_ok = False
-        self.alt_label.config(text="Altimeter: reconnecting…")
-        self._refresh_altimeter_button()
-        self.start_altimeter()
-
-    def _refresh_altimeter_button(self):
-        """Green+disabled when reading OK; red+clickable otherwise."""
-        if Ping1D is None:
-            text = "Altimeter: Install lib"
-            state = "normal"
-            bg = "#b71c1c"
-        else:
-            if self.ping and self._ping_ok:
-                text = "Altimeter: Connected"
-                state = "disabled"
-                bg = "#2e7d32"
-            else:
-                text = "Altimeter: Retry Connect"
-                state = "normal"
-                bg = "#b71c1c"
-        try:
-            self.btn_altimeter.config(text=text, state=state, bg=bg, fg="white", activebackground=bg)
-        except Exception:
-            self.btn_altimeter.config(text=text, state=state)
-
-    def start_altimeter(self):
-        """Initialize Ping1D and start periodic distance polling."""
-        self._ping_ok = False
-        if Ping1D is None:
-            self.alt_label.config(text="Altimeter: library not installed (pip install bluerobotics-ping)")
-            self._refresh_altimeter_button()
-            return
-        try:
-            p = Ping1D()
-            if PING_CONNECT_MODE.lower() == "serial":
-                p.connect_serial(PING_SERIAL_PORT, PING_SERIAL_BAUD)
-            else:
-                p.connect_udp(PING_UDP_HOST, int(PING_UDP_PORT))
-            if p.initialize() is False:
-                self.alt_label.config(text="Altimeter: failed to initialize")
-                self.ping = None
-                self._refresh_altimeter_button()
-                return
-            self.ping = p
-            self.alt_label.config(text="Altimeter: connected, reading…")
-            self._refresh_altimeter_button()
-            self._schedule_ping_poll()
-        except Exception as e:
-            self.ping = None
-            self.alt_label.config(text=f"Altimeter: error — {e}")
-            self._refresh_altimeter_button()
-
-    def _schedule_ping_poll(self):
-        self._poll_ping_once()
-        self._ping_job = self.after(PING_REFRESH_MS, self._schedule_ping_poll)
-
-    def _poll_ping_once(self):
-        if not self.ping:
-            self._ping_ok = False
-            self._refresh_altimeter_button()
-            return
-        try:
-            data = self.ping.get_distance()
-            if data:
-                dist_m = data.get("distance", 0) / 1000.0  # mm -> m
-                conf = data.get("confidence", 0)
-                self.alt_label.config(text=f"Altimeter: {dist_m:.1f} m ({conf}% confidence)")
-                self._ping_ok = True
-            else:
-                self.alt_label.config(text="Altimeter: no data")
-                self._ping_ok = False
-        except Exception:
-            self._ping_ok = False
-        finally:
-            self._refresh_altimeter_button()
 
     # ---------- UI helpers ----------
     def _update_val(self, label, v):
@@ -906,11 +1054,11 @@ class App(tk.Tk):
                                  "Hold (ms) and Interval (ms) must be positive integers.")
             return
 
-        if interval_ms < hold_ms:
+        if interval_ms < hold_ms + FOCUS_LEAD_MS:
             if not messagebox.askyesno(
-                "Interval < Hold",
-                f"Interval ({interval_ms} ms) is shorter than hold ({hold_ms} ms).\n"
-                "This can queue triggers faster than the camera can finish.\n\n"
+                "Interval too short",
+                f"Interval ({interval_ms} ms) is shorter than hold + focus lead ({hold_ms + FOCUS_LEAD_MS} ms).\n"
+                f"The camera needs {FOCUS_LEAD_MS} ms of focus lead before each trigger pulse.\n\n"
                 "Start anyway?"
             ):
                 return
@@ -1039,6 +1187,174 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showwarning("Send failed", str(e))
 
+    # ---------- BlueROV heading / drive (via topside Flask API) ----------
+    def _on_dial_change(self, heading_deg):
+        self.heading_var.set(f"{heading_deg:03.0f}")
+        self.heading_entry_var.set(f"{heading_deg:.0f}")
+        self._pending_heading = heading_deg
+        if self._heading_send_job is None:
+            self._heading_send_job = self.after(HEADING_SEND_THROTTLE_MS, self._flush_heading_send)
+
+    def _flush_heading_send(self):
+        self._heading_send_job = None
+        heading = self._pending_heading
+        if heading is not None:
+            self._pending_heading = None
+            self._send_bluerov_yaw(heading)
+
+    def _apply_heading_entry(self):
+        try:
+            heading = float(self.heading_entry_var.get()) % 360
+        except Exception:
+            messagebox.showerror("Invalid Input", "Heading must be a number (degrees).")
+            return
+        self.heading_dial.set_heading(heading)
+        self.heading_var.set(f"{heading:03.0f}")
+        self._send_bluerov_yaw(heading)
+
+    def _send_bluerov_yaw(self, heading_deg):
+        def worker():
+            try:
+                post_json(BLUEROV_YAW_ABS_URL, {"yaw": float(heading_deg)})
+                self.after(0, lambda: self.append_log(f">> BlueROV YAW_ABS {heading_deg:.1f}"))
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.append_log(f"[BlueROV] yaw send failed: {err}"))
+        threading.Thread(target=worker, daemon=True, name="BlueROV-Yaw").start()
+
+    def _toggle_drive_forward(self):
+        if not self.driving_forward:
+            self.start_drive_forward()
+        else:
+            self.stop_drive_forward()
+
+    def start_drive_forward(self):
+        try:
+            speed = float(self.drive_speed_var.get())
+        except Exception:
+            messagebox.showerror("Invalid Input", "Forward speed (m/s) must be a number.")
+            return
+        if speed <= 0:
+            messagebox.showerror("Invalid Input", "Forward speed (m/s) must be positive.")
+            return
+        self.driving_forward = True
+        self._set_drive_button(True)
+        self.append_log(f"[DRIVE] Forward started at {speed:.2f} m/s")
+        self._send_bluerov_velocity(speed, hold=True)
+
+    def stop_drive_forward(self):
+        self.driving_forward = False
+        self._set_drive_button(False)
+        self.append_log("[DRIVE] Forward stopped")
+        self._send_bluerov_velocity(0.0, hold=False)
+
+    def _send_bluerov_velocity(self, vx, hold):
+        def worker():
+            try:
+                post_json(BLUEROV_SET_VELOCITY_URL,
+                          {"vx": float(vx), "vy": 0.0, "vz": 0.0, "hold": bool(hold)})
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.append_log(f"[BlueROV] velocity send failed: {err}"))
+        threading.Thread(target=worker, daemon=True, name="BlueROV-Velocity").start()
+
+    def _set_drive_button(self, active: bool):
+        if active:
+            try:
+                self.drive_btn.config(text="Stop (Driving Forward)", bg="#2e7d32",
+                                       fg="white", activebackground="#2e7d32")
+            except Exception:
+                self.drive_btn.config(text="Stop (Driving Forward)")
+        else:
+            try:
+                self.drive_btn.config(text="Drive Forward", bg="#b71c1c",
+                                       fg="white", activebackground="#b71c1c")
+            except Exception:
+                self.drive_btn.config(text="Drive Forward")
+
+    # ---------- BlueROV depth (via topside Flask API) ----------
+    # NOTE: /api/depth_step uses NED convention: dz > 0 = deeper, dz < 0 = shallower.
+    def _nudge_depth(self, sign):
+        try:
+            step = float(self.depth_step_var.get())
+        except Exception:
+            messagebox.showerror("Invalid Input", "Depth step (m) must be a number.")
+            return
+        if step <= 0:
+            messagebox.showerror("Invalid Input", "Depth step (m) must be positive.")
+            return
+        dz = sign * step
+        self.append_log(f"[DEPTH] Step {'deeper' if sign > 0 else 'shallower'} by {step:.2f} m")
+        self._send_bluerov_depth_step(dz)
+
+    def _apply_depth_target(self):
+        try:
+            target = float(self.depth_target_var.get())
+        except Exception:
+            messagebox.showerror("Invalid Input", "Target depth (m) must be a number.")
+            return
+
+        def worker():
+            try:
+                status = get_json(BLUEROV_STATUS_URL)
+                current = float(status.get("local_z", 0.0))
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.append_log(f"[BlueROV] depth status read failed: {err}"))
+                return
+            dz = target - current
+            self.after(0, lambda: self.append_log(
+                f"[DEPTH] Set target {target:.2f} m (current {current:.2f} m, dz {dz:+.2f} m)"))
+            self._send_bluerov_depth_step(dz)
+        threading.Thread(target=worker, daemon=True, name="BlueROV-DepthTarget").start()
+
+    def _send_bluerov_depth_step(self, dz):
+        def worker():
+            try:
+                resp = post_json(BLUEROV_DEPTH_STEP_URL, {"dz": float(dz)})
+                if isinstance(resp, dict) and not resp.get("lock", True):
+                    self.after(0, lambda: self.append_log(
+                        "[BlueROV] depth_step accepted but not locked "
+                        "(vehicle may need to be in GUIDED mode)"))
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.append_log(f"[BlueROV] depth step failed: {err}"))
+        threading.Thread(target=worker, daemon=True, name="BlueROV-DepthStep").start()
+
+    def _hold_current_depth(self):
+        def worker():
+            try:
+                post_json(BLUEROV_STOP_DEPTH_URL, {})
+                self.after(0, lambda: self.append_log("[DEPTH] Holding current depth"))
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.append_log(f"[BlueROV] hold depth failed: {err}"))
+        threading.Thread(target=worker, daemon=True, name="BlueROV-DepthHold").start()
+
+    def _release_depth_hold(self):
+        def worker():
+            try:
+                post_json(BLUEROV_CLEAR_DEPTH_HOLD_URL, {})
+                self.after(0, lambda: self.append_log("[DEPTH] Depth hold released"))
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.append_log(f"[BlueROV] release depth hold failed: {err}"))
+        threading.Thread(target=worker, daemon=True, name="BlueROV-DepthRelease").start()
+
+    def _schedule_depth_status_poll(self):
+        self._poll_depth_status_once()
+        self._depth_status_job = self.after(DEPTH_STATUS_POLL_MS, self._schedule_depth_status_poll)
+
+    def _poll_depth_status_once(self):
+        def worker():
+            try:
+                status = get_json(BLUEROV_STATUS_URL, timeout=1.5)
+                depth = float(status.get("local_z", 0.0))
+                self.after(0, lambda: self.depth_readout_var.set(f"Depth: {depth:.2f} m"))
+            except Exception:
+                self.after(0, lambda: self.depth_readout_var.set("Depth: -- m (unreachable)"))
+        threading.Thread(target=worker, daemon=True, name="BlueROV-DepthPoll").start()
+
     # ---------- Pi Exposure Logger ----------
     def toggle_pi_logger(self):
         if not self._pi_running:
@@ -1109,6 +1425,7 @@ class App(tk.Tk):
             self.pi_output.insert("end", text)
             self.pi_output.see("end")
             self.pi_output.config(state="disabled")
+
         self.after(0, ui)
         self.append_log(f"[Pi] {text.rstrip()}")
 
@@ -1168,18 +1485,29 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        # Stop Altimeter polling
-        if self._ping_job is not None:
-            try:
-                self.after_cancel(self._ping_job)
-            except Exception:
-                pass
-            self._ping_job = None
-        self.ping = None
-
         # Stop continuous trigger loop if running
         if getattr(self, "loop_running", False):
             self.stop_loop()
+
+        # Safety: make sure BlueROV isn't left driving forward on exit
+        if getattr(self, "driving_forward", False):
+            self.driving_forward = False
+            try:
+                post_json(BLUEROV_SET_VELOCITY_URL,
+                          {"vx": 0.0, "vy": 0.0, "vz": 0.0, "hold": False}, timeout=1.0)
+            except Exception:
+                pass
+
+        # Stop BlueROV depth status polling
+        if getattr(self, "_depth_status_job", None) is not None:
+            try:
+                self.after_cancel(self._depth_status_job)
+            except Exception:
+                pass
+            self._depth_status_job = None
+
+        # Stop MAVLink seabed-altitude probe
+        self._stop_mavlink_probe()
 
         # Stop Pi logger
         self.stop_pi_logger()

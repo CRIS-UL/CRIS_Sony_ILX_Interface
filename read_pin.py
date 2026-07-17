@@ -62,6 +62,9 @@ csv_lock     = threading.Lock()
 # ---------------------------------------------------------------------------
 def mavlink_thread(mav):
     """Continuously drain MAVLink messages and update shared state cache."""
+    last_seabed_publish = time.time()
+    publish_interval = 1.0  # seconds between seabed altitude updates
+
     while True:
         msg = mav.recv_match(
             type=['GLOBAL_POSITION_INT', 'ATTITUDE', 'RANGEFINDER'],
@@ -69,6 +72,13 @@ def mavlink_thread(mav):
             timeout=1
         )
         if msg is None:
+            # Periodically publish the last known seabed altitude even if no new messages arrive
+            if time.time() - last_seabed_publish >= publish_interval:
+                with state_lock:
+                    altitude = state['altitude']
+                if altitude is not None:
+                    log(f"seabed_alt={altitude:.3f}m")
+                last_seabed_publish = time.time()
             continue
 
         t = msg.get_type()
@@ -87,6 +97,13 @@ def mavlink_thread(mav):
             # Signal ready once we have position + attitude
             if all(state[k] is not None for k in ['lat', 'lon', 'alt', 'roll', 'pitch', 'yaw']):
                 ekf_ready.set()
+
+        if time.time() - last_seabed_publish >= publish_interval:
+            with state_lock:
+                altitude = state['altitude']
+            if altitude is not None:
+                log(f"seabed_alt={altitude:.3f}m")
+            last_seabed_publish = time.time()
 
 
 # ---------------------------------------------------------------------------

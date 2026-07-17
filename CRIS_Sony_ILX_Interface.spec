@@ -1,12 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = [('app.ico', '.'), ('cris_logo.png', '.'), ('StrobeCameraManual.pdf', '.')]
+binaries = []
+hiddenimports = ['paramiko', 'fastcrc']
+tmp_ret = collect_all('pymavlink')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('lxml')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[('app.ico', '.'), ('cris_logo.png', '.'), ('StrobeCameraManual.pdf', '.')],
-    hiddenimports=['paramiko'],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
