@@ -30,8 +30,11 @@ try:
 except ImportError:
     paramiko = None
 
-# Camera focus lead time before the trigger pulse starts
-FOCUS_LEAD_MS = 150
+# Camera focus lead time before the trigger pulse starts (ms).
+# This is sent to the Arduino with each TRIGGER_MS command, so the app value
+# is the single source of truth. With a 1000 ms loop interval and 100 ms hold,
+# 750 ms gives the AF the longest practical window while leaving ~150 ms margin.
+FOCUS_LEAD_MS = 750
 
 def get_app_dir() -> Path:
     """
@@ -51,6 +54,11 @@ def resource_path(rel_path: str) -> str:
 
 
 # -------------------- Configuration --------------------
+# Master switch for the BlueROV heading / drive / depth controls.
+# False = the Heading/Drive and Depth panels are hidden and no BlueROV
+# API calls (yaw, velocity, depth, status polling) are made.
+BLUEROV_CONTROLS_ENABLED = False
+
 DEFAULT_HOST = "192.168.2.70"
 DEFAULT_PORT = 9000
 MANUAL_FILENAME = "StrobeCameraManual.pdf"  # put this PDF next to main.py (or bundle with PyInstaller)
@@ -329,8 +337,9 @@ class App(tk.Tk):
         ttk.Button(trig_ctrl, text="Single Trigger",
                    command=lambda: self.send_cmd("TRIGGER")).pack(side="left", padx=5)
 
-        self.trig_time_var = tk.StringVar(value="100")       # default 5 ms
-        self.trig_interval_var = tk.StringVar(value="1000")  # default 1000 ms
+        self.trig_time_var = tk.StringVar(value="100")       # trigger hold (ms)
+        self.trig_interval_var = tk.StringVar(value="1000")  # loop interval (ms)
+        self.focus_lead_var = tk.StringVar(value=str(FOCUS_LEAD_MS))  # focus lead (ms)
 
         self.loop_running = False
         self.loop_job = None
@@ -343,7 +352,10 @@ class App(tk.Tk):
 
         self.loop_btn = tk.Button(trig_ctrl, text="Start Loop", command=toggle_loop, width=16)
         self.loop_btn.pack(side="left", padx=10)
+        ttk.Label(trig_ctrl, text="Interval (ms):").pack(side="left")
         ttk.Entry(trig_ctrl, textvariable=self.trig_interval_var, width=8).pack(side="left")
+        ttk.Label(trig_ctrl, text="Focus lead (ms):").pack(side="left", padx=(10, 0))
+        ttk.Entry(trig_ctrl, textvariable=self.focus_lead_var, width=6).pack(side="left")
 
 
         ttk.Button(trig_ctrl, text="Lamp OFF",
@@ -360,75 +372,77 @@ class App(tk.Tk):
                                     command=self.toggle_latest_window, width=22)
         self.btn_latest.pack(side="left", padx=6)
 
-        # -------------------- Heading & Drive (BlueROV) --------------------
-        heading_frame = ttk.LabelFrame(root, text="Heading / Drive (BlueROV)")
-        heading_frame.pack(fill="x", pady=10)
-
-        self.heading_dial = HeadingDial(heading_frame, size=150, on_change=self._on_dial_change)
-        self.heading_dial.pack(side="left", padx=10, pady=8)
-
-        heading_ctrl = ttk.Frame(heading_frame)
-        heading_ctrl.pack(side="left", fill="x", expand=True, padx=10, pady=8)
-
-        hrow = ttk.Frame(heading_ctrl); hrow.pack(fill="x", pady=4)
-        ttk.Label(hrow, text="Heading (deg):").pack(side="left")
-        self.heading_var = tk.StringVar(value="000")
-        self.heading_readout = ttk.Label(hrow, textvariable=self.heading_var, width=5,
-                                          font=("Segoe UI", 11, "bold"))
-        self.heading_readout.pack(side="left", padx=(6, 12))
-
-        self.heading_entry_var = tk.StringVar(value="0")
-        ttk.Entry(hrow, textvariable=self.heading_entry_var, width=6).pack(side="left")
-        ttk.Button(hrow, text="Set Heading",
-                   command=self._apply_heading_entry).pack(side="left", padx=6)
-
-        # Pending/throttle state for dial-drag heading sends
+        # BlueROV state defaults — always initialised so the rest of the app
+        # (e.g. on_close) is safe whether or not the controls are enabled.
         self._pending_heading = None
         self._heading_send_job = None
-
-        drow = ttk.Frame(heading_ctrl); drow.pack(fill="x", pady=(10, 4))
-        ttk.Label(drow, text="Forward speed (m/s):").pack(side="left")
-        self.drive_speed_var = tk.StringVar(value=str(DEFAULT_DRIVE_SPEED_MPS))
-        ttk.Entry(drow, textvariable=self.drive_speed_var, width=6).pack(side="left", padx=(6, 12))
-
         self.driving_forward = False
-        self.drive_btn = tk.Button(drow, text="Drive Forward",
-                                    command=self._toggle_drive_forward, width=16)
-        self.drive_btn.pack(side="left")
-        self._set_drive_button(False)
-
-        # -------------------- Depth (BlueROV) --------------------
-        depth_frame = ttk.LabelFrame(root, text="Depth (BlueROV)")
-        depth_frame.pack(fill="x", pady=10)
-
-        self.depth_readout_var = tk.StringVar(value="Depth: -- m")
-        ttk.Label(depth_frame, textvariable=self.depth_readout_var, width=16,
-                  font=("Segoe UI", 11, "bold")).pack(side="left", padx=10)
-
-        depth_ctrl = ttk.Frame(depth_frame)
-        depth_ctrl.pack(side="left", fill="x", expand=True, padx=10, pady=8)
-
-        dtrow = ttk.Frame(depth_ctrl); dtrow.pack(fill="x", pady=4)
-        ttk.Label(dtrow, text="Target depth (m):").pack(side="left")
-        self.depth_target_var = tk.StringVar(value="0.0")
-        ttk.Entry(dtrow, textvariable=self.depth_target_var, width=6).pack(side="left", padx=(6, 12))
-        ttk.Button(dtrow, text="Set Depth", command=self._apply_depth_target).pack(side="left")
-
-        dsrow = ttk.Frame(depth_ctrl); dsrow.pack(fill="x", pady=4)
-        ttk.Label(dsrow, text="Step (m):").pack(side="left")
-        self.depth_step_var = tk.StringVar(value=str(DEFAULT_DEPTH_STEP_M))
-        ttk.Entry(dsrow, textvariable=self.depth_step_var, width=6).pack(side="left", padx=(6, 12))
-        ttk.Button(dsrow, text="▲ Shallower", width=11,
-                   command=lambda: self._nudge_depth(-1)).pack(side="left", padx=2)
-        ttk.Button(dsrow, text="▼ Deeper", width=11,
-                   command=lambda: self._nudge_depth(1)).pack(side="left", padx=2)
-        ttk.Button(dsrow, text="Hold Current Depth",
-                   command=self._hold_current_depth).pack(side="left", padx=(12, 4))
-        ttk.Button(dsrow, text="Release Depth Hold",
-                   command=self._release_depth_hold).pack(side="left", padx=4)
-
         self._depth_status_job = None
-        self._schedule_depth_status_poll()
+
+        if BLUEROV_CONTROLS_ENABLED:
+            # -------------------- Heading & Drive (BlueROV) --------------------
+            heading_frame = ttk.LabelFrame(root, text="Heading / Drive (BlueROV)")
+            heading_frame.pack(fill="x", pady=10)
+
+            self.heading_dial = HeadingDial(heading_frame, size=150, on_change=self._on_dial_change)
+            self.heading_dial.pack(side="left", padx=10, pady=8)
+
+            heading_ctrl = ttk.Frame(heading_frame)
+            heading_ctrl.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+            hrow = ttk.Frame(heading_ctrl); hrow.pack(fill="x", pady=4)
+            ttk.Label(hrow, text="Heading (deg):").pack(side="left")
+            self.heading_var = tk.StringVar(value="000")
+            self.heading_readout = ttk.Label(hrow, textvariable=self.heading_var, width=5,
+                                              font=("Segoe UI", 11, "bold"))
+            self.heading_readout.pack(side="left", padx=(6, 12))
+
+            self.heading_entry_var = tk.StringVar(value="0")
+            ttk.Entry(hrow, textvariable=self.heading_entry_var, width=6).pack(side="left")
+            ttk.Button(hrow, text="Set Heading",
+                       command=self._apply_heading_entry).pack(side="left", padx=6)
+
+            drow = ttk.Frame(heading_ctrl); drow.pack(fill="x", pady=(10, 4))
+            ttk.Label(drow, text="Forward speed (m/s):").pack(side="left")
+            self.drive_speed_var = tk.StringVar(value=str(DEFAULT_DRIVE_SPEED_MPS))
+            ttk.Entry(drow, textvariable=self.drive_speed_var, width=6).pack(side="left", padx=(6, 12))
+
+            self.drive_btn = tk.Button(drow, text="Drive Forward",
+                                        command=self._toggle_drive_forward, width=16)
+            self.drive_btn.pack(side="left")
+            self._set_drive_button(False)
+
+            # -------------------- Depth (BlueROV) --------------------
+            depth_frame = ttk.LabelFrame(root, text="Depth (BlueROV)")
+            depth_frame.pack(fill="x", pady=10)
+
+            self.depth_readout_var = tk.StringVar(value="Depth: -- m")
+            ttk.Label(depth_frame, textvariable=self.depth_readout_var, width=16,
+                      font=("Segoe UI", 11, "bold")).pack(side="left", padx=10)
+
+            depth_ctrl = ttk.Frame(depth_frame)
+            depth_ctrl.pack(side="left", fill="x", expand=True, padx=10, pady=8)
+
+            dtrow = ttk.Frame(depth_ctrl); dtrow.pack(fill="x", pady=4)
+            ttk.Label(dtrow, text="Target depth (m):").pack(side="left")
+            self.depth_target_var = tk.StringVar(value="0.0")
+            ttk.Entry(dtrow, textvariable=self.depth_target_var, width=6).pack(side="left", padx=(6, 12))
+            ttk.Button(dtrow, text="Set Depth", command=self._apply_depth_target).pack(side="left")
+
+            dsrow = ttk.Frame(depth_ctrl); dsrow.pack(fill="x", pady=4)
+            ttk.Label(dsrow, text="Step (m):").pack(side="left")
+            self.depth_step_var = tk.StringVar(value=str(DEFAULT_DEPTH_STEP_M))
+            ttk.Entry(dsrow, textvariable=self.depth_step_var, width=6).pack(side="left", padx=(6, 12))
+            ttk.Button(dsrow, text="▲ Shallower", width=11,
+                       command=lambda: self._nudge_depth(-1)).pack(side="left", padx=2)
+            ttk.Button(dsrow, text="▼ Deeper", width=11,
+                       command=lambda: self._nudge_depth(1)).pack(side="left", padx=2)
+            ttk.Button(dsrow, text="Hold Current Depth",
+                       command=self._hold_current_depth).pack(side="left", padx=(12, 4))
+            ttk.Button(dsrow, text="Release Depth Hold",
+                       command=self._release_depth_hold).pack(side="left", padx=4)
+
+            self._schedule_depth_status_poll()
 
         # -------------------- Pi Exposure Logger --------------------
         pi_frame = ttk.LabelFrame(root, text="Pi Exposure Logger")
@@ -1047,25 +1061,28 @@ class App(tk.Tk):
         try:
             hold_ms = int(self.trig_time_var.get())
             interval_ms = int(self.trig_interval_var.get())
-            if hold_ms <= 0 or interval_ms <= 0:
+            focus_ms = int(self.focus_lead_var.get())
+            if hold_ms <= 0 or interval_ms <= 0 or focus_ms < 0:
                 raise ValueError
         except Exception:
             messagebox.showerror("Invalid Input",
-                                 "Hold (ms) and Interval (ms) must be positive integers.")
+                                 "Hold (ms), Interval (ms) and Focus lead (ms) must be valid integers.")
             return
 
-        if interval_ms < hold_ms + FOCUS_LEAD_MS:
+        if interval_ms < hold_ms + focus_ms + 100:
             if not messagebox.askyesno(
                 "Interval too short",
-                f"Interval ({interval_ms} ms) is shorter than hold + focus lead ({hold_ms + FOCUS_LEAD_MS} ms).\n"
-                f"The camera needs {FOCUS_LEAD_MS} ms of focus lead before each trigger pulse.\n\n"
+                f"Interval ({interval_ms} ms) is shorter than hold + focus lead + 100 ms margin "
+                f"({hold_ms + focus_ms + 100} ms).\n"
+                f"The Arduino is busy for {hold_ms + focus_ms} ms per capture and needs some "
+                "headroom to process the next command.\n\n"
                 "Start anyway?"
             ):
                 return
 
         self.loop_running = True
         self._set_loop_button(True)
-        self.append_log(f"[LOOP] Started: hold={hold_ms} ms, interval={interval_ms} ms")
+        self.append_log(f"[LOOP] Started: hold={hold_ms} ms, focus lead={focus_ms} ms, interval={interval_ms} ms")
         self._loop_tick()
 
     def stop_loop(self):
@@ -1085,7 +1102,8 @@ class App(tk.Tk):
         try:
             hold_ms = int(self.trig_time_var.get())
             interval_ms = int(self.trig_interval_var.get())
-            if hold_ms <= 0 or interval_ms <= 0:
+            focus_ms = int(self.focus_lead_var.get())
+            if hold_ms <= 0 or interval_ms <= 0 or focus_ms < 0:
                 raise ValueError
         except Exception:
             self.append_log("[LOOP] Invalid inputs; stopping loop.")
@@ -1093,8 +1111,8 @@ class App(tk.Tk):
             return
 
         try:
-            self.client.send_line(f"TRIGGER_MS {hold_ms}")
-            self.append_log(f">> TRIGGER_MS {hold_ms}")
+            self.client.send_line(f"TRIGGER_MS {hold_ms} {focus_ms}")
+            self.append_log(f">> TRIGGER_MS {hold_ms} {focus_ms}")
         except Exception as e:
             messagebox.showwarning("Send failed", str(e))
             self.stop_loop()
@@ -1213,6 +1231,8 @@ class App(tk.Tk):
         self._send_bluerov_yaw(heading)
 
     def _send_bluerov_yaw(self, heading_deg):
+        if not BLUEROV_CONTROLS_ENABLED:
+            return
         def worker():
             try:
                 post_json(BLUEROV_YAW_ABS_URL, {"yaw": float(heading_deg)})
@@ -1249,6 +1269,8 @@ class App(tk.Tk):
         self._send_bluerov_velocity(0.0, hold=False)
 
     def _send_bluerov_velocity(self, vx, hold):
+        if not BLUEROV_CONTROLS_ENABLED:
+            return
         def worker():
             try:
                 post_json(BLUEROV_SET_VELOCITY_URL,
@@ -1309,6 +1331,8 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="BlueROV-DepthTarget").start()
 
     def _send_bluerov_depth_step(self, dz):
+        if not BLUEROV_CONTROLS_ENABLED:
+            return
         def worker():
             try:
                 resp = post_json(BLUEROV_DEPTH_STEP_URL, {"dz": float(dz)})
@@ -1322,6 +1346,8 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="BlueROV-DepthStep").start()
 
     def _hold_current_depth(self):
+        if not BLUEROV_CONTROLS_ENABLED:
+            return
         def worker():
             try:
                 post_json(BLUEROV_STOP_DEPTH_URL, {})
@@ -1332,6 +1358,8 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="BlueROV-DepthHold").start()
 
     def _release_depth_hold(self):
+        if not BLUEROV_CONTROLS_ENABLED:
+            return
         def worker():
             try:
                 post_json(BLUEROV_CLEAR_DEPTH_HOLD_URL, {})
@@ -1342,6 +1370,8 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="BlueROV-DepthRelease").start()
 
     def _schedule_depth_status_poll(self):
+        if not BLUEROV_CONTROLS_ENABLED:
+            return
         self._poll_depth_status_once()
         self._depth_status_job = self.after(DEPTH_STATUS_POLL_MS, self._schedule_depth_status_poll)
 

@@ -28,7 +28,7 @@ bool lampOn = false;
 // ====== Camera Focus + Trigger ======
 const int cameraFocusPin   = 5; // FOCUS line (free)
 const int cameraTriggerPin = 6; // TRIGGER line
-const unsigned long cameraFocusLeadMs = 150; // ms to assert focus before trigger
+const unsigned long cameraFocusLeadMs = 750; // ms to assert focus before trigger (default; can be overridden per command)
 
 void cameraFocusBegin() {
   pinMode(cameraFocusPin, OUTPUT);
@@ -147,11 +147,24 @@ void handleCommand(const String &line, EthernetClient &client) {
     return;
   }
   if (cmd.startsWith("TRIGGER_MS")) {
+    // Syntax: TRIGGER_MS <hold_ms> [focus_lead_ms]
+    // If focus_lead_ms is omitted, cameraFocusLeadMs is used.
     int sep = cmd.indexOf(' ');
     if (sep > 0) {
-      long ms = cmd.substring(sep + 1).toInt();
+      String args = cmd.substring(sep + 1);
+      args.trim();
+      long ms = args.toInt();                 // first number = trigger hold
+      long focusMs = -1;                      // optional second number = focus lead
+      int sep2 = args.indexOf(' ');
+      if (sep2 > 0) {
+        focusMs = args.substring(sep2 + 1).toInt();
+      }
       if (ms > 0 && ms <= 10000) {
-        cameraTrigger_us((unsigned long)ms * 1000UL);  // micros-accurate hold
+        if (focusMs >= 0 && focusMs <= 5000) {
+          cameraTrigger_us((unsigned long)ms * 1000UL, (unsigned long)focusMs);
+        } else {
+          cameraTrigger_us((unsigned long)ms * 1000UL);  // default focus lead
+        }
         sendLine(client, "OK TRIGGERED");
       } else {
         sendLine(client, "ERR TRIGGER_MS OUT OF RANGE (1..10000)");
@@ -251,7 +264,7 @@ void setup() {
   Serial.print(F("IP: "));      Serial.println(Ethernet.localIP());
   Serial.print(F("TCP server listening on port ")); Serial.println(PORT);
   Serial.println(F("Commands: ~... | LAMP OFF | STROBE_INTENSITY <0..100> | LAMP_INTENSITY <0..100> | STATUS"));
-  Serial.println(F("          TRIGGER | TRIGGER_MS <ms> (FOCUS precedes TRIGGER; micros-accurate hold)"));
+  Serial.println(F("          TRIGGER | TRIGGER_MS <ms> [focus_ms] (FOCUS precedes TRIGGER; micros-accurate hold)"));
 
   // Ensure camera lines idle high-Z
   pinMode(cameraFocusPin, INPUT);
