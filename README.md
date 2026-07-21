@@ -248,6 +248,10 @@ pyinstaller --onefile --windowed --name CRIS_Sony_ILX_Interface --icon "app.ico"
 
 ---
 
+## Measuring throughput
+
+- iperf3 -c 192.168.2.2 -t 90 -R
+
 ## Notes & credits
 
 - **Blue Robotics Ping1D** via `brping` (installed by `bluerobotics-ping`).
