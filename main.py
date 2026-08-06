@@ -368,10 +368,6 @@ class App(tk.Tk):
                                  command=self.restart_camera_with_gui, width=22)
         self.btn_gui.pack(side="left", padx=6)
 
-        self.btn_latest = tk.Button(trig_ctrl, text="Show Latest Image",
-                                    command=self.toggle_latest_window, width=22)
-        self.btn_latest.pack(side="left", padx=6)
-
         # BlueROV state defaults — always initialised so the rest of the app
         # (e.g. on_close) is safe whether or not the controls are enabled.
         self._pending_heading = None
@@ -502,17 +498,11 @@ class App(tk.Tk):
             controls.columnconfigure(i, weight=0)
         controls.columnconfigure(4, weight=1)  # spacer
 
-        self.btn_headless = tk.Button(
-            controls, text="Live View (Headless)",
-            command=self.restart_camera_headless, width=22
-        )
-        self.btn_headless.grid(row=0, column=0, padx=6, pady=4, sticky="w")
-
         self.btn_arduino = tk.Button(
             controls, text="Arduino: Retry Connect",
             command=self.retry_arduino_connect, width=22
         )
-        self.btn_arduino.grid(row=0, column=1, padx=6, pady=4, sticky="w")
+        self.btn_arduino.grid(row=0, column=0, padx=6, pady=4, sticky="w")
 
         ttk.Label(controls, text="").grid(row=0, column=4, sticky="ew")  # spacer
 
@@ -801,7 +791,6 @@ class App(tk.Tk):
                     btn.config(state="normal")
 
         mode = self.camera_mode  # "headless", "gui", or None
-        set_btn(self.btn_headless, active=(mode == "headless"))
         set_btn(self.btn_gui,      active=(mode == "gui"))
 
     # ---------- Latest Image popup ----------
@@ -863,17 +852,8 @@ class App(tk.Tk):
         self._refresh_latest_button()
 
     def _refresh_latest_button(self):
-        open_ = bool(self.latest_win and tk.Toplevel.winfo_exists(self.latest_win))
-        try:
-            if open_:
-                self.btn_latest.config(text="Latest Image: Open", state="disabled",
-                                       bg="#2e7d32", fg="white", activebackground="#2e7d32")
-            else:
-                self.btn_latest.config(text="Show Latest Image", state="normal",
-                                       bg="#b71c1c", fg="white", activebackground="#b71c1c")
-        except Exception:
-            self.btn_latest.config(text=("Latest Image: Open" if open_ else "Show Latest Image"),
-                                   state=("disabled" if open_ else "normal"))
+        # The "Show Latest Image" button has been removed; nothing to update.
+        return
 
     def _schedule_latest_poll(self):
         self._poll_latest_once()
