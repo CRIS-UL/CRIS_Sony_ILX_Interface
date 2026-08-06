@@ -25,44 +25,83 @@ uint8_t strobeIntensity = 0;  // 0..100
 uint8_t lampIntensity   = 0;  // 0..100
 bool lampOn = false;
 
-// ====== Camera Focus + Trigger ======
-const int cameraFocusPin   = 5; // FOCUS line (free)
-const int cameraTriggerPin = 6; // TRIGGER line
-const unsigned long cameraFocusLeadMs = 750; // ms to assert focus before trigger (default; can be overridden per command)
+// ============================================================
+//  Camera Focus + Trigger  (Sony ILX-LR1)
+// ============================================================
+//  Molex Micro-Fit control terminal:
+//    pin 4 FOCUS    - input to camera, pull to GND to focus (S1)
+//    pin 5 TRIGGER  - input to camera, pull to GND to shoot (S2); FOCUS must be low first
+//
+//  FOCUS/TRIGGER idle state inside the camera is 3.15 V via 31k. Drive them
+//  OPEN-DRAIN only: OUTPUT-LOW to assert, INPUT (high-Z) to release. Never drive HIGH.
+//
+//  Camera settings that must be right for AF to work each shot:
+//    - AF/MF switch on the lens set to AF
+//    - Focus Mode = Continuous AF (AF-C)
+//    - AF w/ Shutter = On   (so the FOCUS line actually commands AF)
+//    - Pre-AF = Off         (so only the FOCUS line drives focus)
+// ------------------------------------------------------------
+
+const int cameraFocusPin   = 5;  // FOCUS   (connector pin 4)
+const int cameraTriggerPin = 6;  // TRIGGER (connector pin 5)
+
+const unsigned long cameraFocusLeadMs   = 500; // AF convergence time
+const unsigned long cameraTriggerHoldMs = 60;  // S2 pulse width (spec min 4 ms)
+const unsigned long cameraFocusTailMs   = 20;  // keep focus asserted briefly past the shot
+
+// *** REFOCUS FIX ***
+// Guaranteed high-Z (S1 released) time before every acquisition, so the camera
+// registers a real focus release and re-arms AF each cycle. Raise to 400-500 if
+// it still won't refocus.
+const unsigned long cameraReleaseGapMs  = 300;
+
+// Timestamp (ms) of the last genuine FOCUS release. Refocus gap is measured from here.
+unsigned long lastFocusReleaseMs = 0;
 
 void cameraFocusBegin() {
   pinMode(cameraFocusPin, OUTPUT);
-  digitalWrite(cameraFocusPin, LOW);
+  digitalWrite(cameraFocusPin, LOW);   // S1 asserted
 }
 
 void cameraFocusEnd() {
-  pinMode(cameraFocusPin, INPUT); // high-Z
+  pinMode(cameraFocusPin, INPUT);      // high-Z: S1 released
+  lastFocusReleaseMs = millis();       // start the refocus gap clock from HERE
 }
 
-void cameraTrigger_us(unsigned long press_us, unsigned long focus_lead_ms = cameraFocusLeadMs) {
-  // Pull focus first, then start the trigger pulse
+// Runs one full FOCUS -> TRIGGER -> release cycle.
+void cameraTriggerCycle(unsigned long holdMs      = cameraTriggerHoldMs,
+                        unsigned long focusLeadMs = cameraFocusLeadMs) {
+  // 1) Ensure FOCUS has been released long enough since the last shot so AF re-arms.
+  //    FOCUS is already high-Z here, so this is genuine S1-released time.
+  while ((unsigned long)(millis() - lastFocusReleaseMs) < cameraReleaseGapMs) {
+    /* wait: let the camera fully release S1 */
+  }
+
+  // 2) Assert FOCUS and give AF time to converge.
   cameraFocusBegin();
-  if (focus_lead_ms > 0) {
-    delay(focus_lead_ms);
-  }
+  delay(focusLeadMs);
 
+  // 3) Fire TRIGGER.
   pinMode(cameraTriggerPin, OUTPUT);
-  digitalWrite(cameraTriggerPin, LOW);
+  digitalWrite(cameraTriggerPin, LOW);   // S2 asserted
+  delay(holdMs);
+  pinMode(cameraTriggerPin, INPUT);      // S2 released
 
-  // Measure hold time after trigger is low
-  unsigned long t0 = micros();
-  while ((unsigned long)(micros() - t0) < press_us) {
-    // busy-wait; press duration accurate to a few µs (AVR ISR jitter aside)
-  }
-
-  // Release trigger then focus (open switch behavior)
-  pinMode(cameraTriggerPin, INPUT); // high-Z
+  // 4) Hold focus a moment past the shot, then release (stamps lastFocusReleaseMs).
+  delay(cameraFocusTailMs);
   cameraFocusEnd();
 }
 
-// Millisecond wrapper (maintains your existing API)
-void cameraTrigger(unsigned long press_ms = 1000) {
-  cameraTrigger_us(press_ms * 1000UL);
+// Discard any bytes that queued up on this client while we were busy capturing.
+// This stops a backlog from building when the host fires triggers faster than a
+// capture takes, so pressing "Stop Loop" on the host takes effect promptly instead
+// of the Arduino draining a pile of already-buffered TRIGGER commands.
+// NOTE: this is a blunt instrument - it also discards any non-trigger commands
+// (lamp/strobe/status) that happened to arrive during the capture window.
+void drainClient(EthernetClient &client) {
+  while (client.connected() && client.available()) {
+    client.read();
+  }
 }
 
 // ---------- Forward decl ----------
@@ -75,7 +114,7 @@ void sendLine(EthernetClient &c, const char *s) {
   c.write('\n');
 }
 
-// Forward any line beginning with '~' over RS-485.
+// Forward any line beginning with '~' or '$' over RS-485.
 bool maybe_forward_rs485(const String &cmd, EthernetClient &client) {
   if (cmd.length() && (cmd.charAt(0) == '~' || cmd.charAt(0) == '$')) {
     rs485_send_line(cmd);
@@ -140,31 +179,33 @@ void handleCommand(const String &line, EthernetClient &client) {
 
   if (maybe_forward_rs485(cmd, client)) return;
 
-  // ====== Trigger commands (FOCUS+TRIGGER with micros) ======
+  // ====== Trigger commands (FOCUS precedes TRIGGER; refocus gap enforced) ======
   if (cmd.equalsIgnoreCase("TRIGGER")) {
-    cameraTrigger(1000); // 1s
+    cameraTriggerCycle();
+    drainClient(client);   // discard anything queued during the capture
     sendLine(client, "OK TRIGGERED");
     return;
   }
   if (cmd.startsWith("TRIGGER_MS")) {
     // Syntax: TRIGGER_MS <hold_ms> [focus_lead_ms]
-    // If focus_lead_ms is omitted, cameraFocusLeadMs is used.
+    // hold_ms above ~100 buys nothing; focus_lead_ms is the AF convergence window.
     int sep = cmd.indexOf(' ');
     if (sep > 0) {
       String args = cmd.substring(sep + 1);
       args.trim();
       long ms = args.toInt();                 // first number = trigger hold
-      long focusMs = -1;                      // optional second number = focus lead
+      long focusMs = -1;                       // optional second number = focus lead
       int sep2 = args.indexOf(' ');
       if (sep2 > 0) {
         focusMs = args.substring(sep2 + 1).toInt();
       }
       if (ms > 0 && ms <= 10000) {
         if (focusMs >= 0 && focusMs <= 5000) {
-          cameraTrigger_us((unsigned long)ms * 1000UL, (unsigned long)focusMs);
+          cameraTriggerCycle((unsigned long)ms, (unsigned long)focusMs);
         } else {
-          cameraTrigger_us((unsigned long)ms * 1000UL);  // default focus lead
+          cameraTriggerCycle((unsigned long)ms);  // default focus lead
         }
+        drainClient(client);   // discard anything queued during the capture
         sendLine(client, "OK TRIGGERED");
       } else {
         sendLine(client, "ERR TRIGGER_MS OUT OF RANGE (1..10000)");
@@ -264,11 +305,14 @@ void setup() {
   Serial.print(F("IP: "));      Serial.println(Ethernet.localIP());
   Serial.print(F("TCP server listening on port ")); Serial.println(PORT);
   Serial.println(F("Commands: ~... | LAMP OFF | STROBE_INTENSITY <0..100> | LAMP_INTENSITY <0..100> | STATUS"));
-  Serial.println(F("          TRIGGER | TRIGGER_MS <ms> [focus_ms] (FOCUS precedes TRIGGER; micros-accurate hold)"));
+  Serial.println(F("          TRIGGER | TRIGGER_MS <ms> [focus_ms]  (drains backlog each capture)"));
 
-  // Ensure camera lines idle high-Z
+  // Camera FOCUS/TRIGGER idle high-Z (open-drain released).
   pinMode(cameraFocusPin, INPUT);
   pinMode(cameraTriggerPin, INPUT);
+
+  // Prime the refocus gap so the first shot isn't forced to wait.
+  lastFocusReleaseMs = millis() - cameraReleaseGapMs;
 }
 
 void loop() {

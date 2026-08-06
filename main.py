@@ -344,6 +344,16 @@ class App(tk.Tk):
         self.loop_running = False
         self.loop_job = None
 
+        # --- ACK-gated trigger loop state ---
+        # The loop sends one TRIGGER_MS, then waits for the Arduino's
+        # "OK TRIGGERED" reply before sending the next. This keeps at most one
+        # command in flight, so nothing backlogs in the socket buffer and
+        # pressing Stop takes effect immediately.
+        self._trigger_inflight = False
+        self._trigger_sent_time = 0.0
+        self._trigger_watchdog_job = None
+        self._trigger_timeout_ms = 2000   # max wait for an ACK before moving on
+
         def toggle_loop():
             if not self.loop_running:
                 self.start_loop()
@@ -1019,6 +1029,10 @@ class App(tk.Tk):
     def on_line_received(self, line):
         def ui():
             self.append_log(f"<< {line}")
+            # ACK-gated loop: the Arduino replies "OK TRIGGERED" when a capture
+            # cycle finishes. That reply is what releases the next trigger.
+            if self._trigger_inflight and line.startswith("OK TRIGGERED"):
+                self._on_trigger_ack()
             payload = self._extract_rx_payload(line)
             if payload:
                 self.append_rx(payload)
@@ -1036,7 +1050,7 @@ class App(tk.Tk):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self._write_line_to_file(f"{ts} [RX] {text}")
 
-    # ---------- Continuous trigger loop ----------
+    # ---------- Continuous trigger loop (ACK-gated) ----------
     def start_loop(self):
         try:
             hold_ms = int(self.trig_time_var.get())
@@ -1049,41 +1063,36 @@ class App(tk.Tk):
                                  "Hold (ms), Interval (ms) and Focus lead (ms) must be valid integers.")
             return
 
-        if interval_ms < hold_ms + focus_ms + 100:
-            if not messagebox.askyesno(
-                "Interval too short",
-                f"Interval ({interval_ms} ms) is shorter than hold + focus lead + 100 ms margin "
-                f"({hold_ms + focus_ms + 100} ms).\n"
-                f"The Arduino is busy for {hold_ms + focus_ms} ms per capture and needs some "
-                "headroom to process the next command.\n\n"
-                "Start anyway?"
-            ):
-                return
-
         self.loop_running = True
+        self._trigger_inflight = False
         self._set_loop_button(True)
-        self.append_log(f"[LOOP] Started: hold={hold_ms} ms, focus lead={focus_ms} ms, interval={interval_ms} ms")
+        self.append_log(f"[LOOP] Started: hold={hold_ms} ms, focus lead={focus_ms} ms, "
+                        f"interval={interval_ms} ms (min spacing; waits for ACK each shot)")
         self._loop_tick()
 
     def stop_loop(self):
         self.loop_running = False
+        self._trigger_inflight = False
         self._set_loop_button(False)
-        if self.loop_job is not None:
-            try:
-                self.after_cancel(self.loop_job)
-            except Exception:
-                pass
-            self.loop_job = None
+        for attr in ("loop_job", "_trigger_watchdog_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         self.append_log("[LOOP] Stopped")
 
     def _loop_tick(self):
         if not self.loop_running:
             return
+        if self._trigger_inflight:
+            return  # previous capture not yet acknowledged; don't stack another
         try:
             hold_ms = int(self.trig_time_var.get())
-            interval_ms = int(self.trig_interval_var.get())
             focus_ms = int(self.focus_lead_var.get())
-            if hold_ms <= 0 or interval_ms <= 0 or focus_ms < 0:
+            if hold_ms <= 0 or focus_ms < 0:
                 raise ValueError
         except Exception:
             self.append_log("[LOOP] Invalid inputs; stopping loop.")
@@ -1093,12 +1102,44 @@ class App(tk.Tk):
         try:
             self.client.send_line(f"TRIGGER_MS {hold_ms} {focus_ms}")
             self.append_log(f">> TRIGGER_MS {hold_ms} {focus_ms}")
+            self._trigger_inflight = True
+            self._trigger_sent_time = time.time()
+            self._trigger_watchdog_job = self.after(self._trigger_timeout_ms, self._trigger_watchdog)
         except Exception as e:
             messagebox.showwarning("Send failed", str(e))
             self.stop_loop()
-            return
 
-        self.loop_job = self.after(interval_ms, self._loop_tick)
+    def _on_trigger_ack(self):
+        """Called when the Arduino confirms a capture. Schedules the next one."""
+        if not self._trigger_inflight:
+            return
+        self._trigger_inflight = False
+        if self._trigger_watchdog_job is not None:
+            try:
+                self.after_cancel(self._trigger_watchdog_job)
+            except Exception:
+                pass
+            self._trigger_watchdog_job = None
+        if not self.loop_running:
+            return
+        try:
+            interval_ms = int(self.trig_interval_var.get())
+        except Exception:
+            interval_ms = 1000
+        # interval acts as a MINIMUM spacing: if the capture took longer than the
+        # interval, fire the next immediately; otherwise wait out the remainder.
+        elapsed_ms = (time.time() - self._trigger_sent_time) * 1000.0
+        delay = max(0, int(interval_ms - elapsed_ms))
+        self.loop_job = self.after(delay, self._loop_tick)
+
+    def _trigger_watchdog(self):
+        """Safety net: if an ACK never arrives, don't freeze the loop forever."""
+        self._trigger_watchdog_job = None
+        if not self.loop_running:
+            return
+        self.append_log("[LOOP] No ACK within timeout; sending next anyway.")
+        self._trigger_inflight = False
+        self.loop_job = self.after(0, self._loop_tick)
 
     def _set_loop_button(self, running: bool):
         if running:
