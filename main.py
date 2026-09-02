@@ -155,6 +155,7 @@ class HeadingDial(tk.Canvas):
         self.center = (size / 2, size / 2)
         self.heading = 0.0
         self.on_change = on_change
+        self._liveview_rotation = 0
 
         self.bind("<Button-1>", self._on_pointer)
         self.bind("<B1-Motion>", self._on_pointer)
@@ -344,16 +345,6 @@ class App(tk.Tk):
         self.loop_running = False
         self.loop_job = None
 
-        # --- ACK-gated trigger loop state ---
-        # The loop sends one TRIGGER_MS, then waits for the Arduino's
-        # "OK TRIGGERED" reply before sending the next. This keeps at most one
-        # command in flight, so nothing backlogs in the socket buffer and
-        # pressing Stop takes effect immediately.
-        self._trigger_inflight = False
-        self._trigger_sent_time = 0.0
-        self._trigger_watchdog_job = None
-        self._trigger_timeout_ms = 2000   # max wait for an ACK before moving on
-
         def toggle_loop():
             if not self.loop_running:
                 self.start_loop()
@@ -377,6 +368,10 @@ class App(tk.Tk):
         self.btn_gui = tk.Button(trig_ctrl, text="Show Camera GUI",
                                  command=self.restart_camera_with_gui, width=22)
         self.btn_gui.pack(side="left", padx=6)
+
+        self.btn_latest = tk.Button(trig_ctrl, text="Show Latest Image",
+                                    command=self.toggle_latest_window, width=22)
+        self.btn_latest.pack(side="left", padx=6)
 
         # BlueROV state defaults — always initialised so the rest of the app
         # (e.g. on_close) is safe whether or not the controls are enabled.
@@ -489,30 +484,51 @@ class App(tk.Tk):
         self._seabed_alt_lock = threading.Lock()
 
         # -------------------- Live View panel --------------------
-        live_frame = ttk.LabelFrame(root, text=f"Live View ({LIVEVIEW_TARGET_W}×{LIVEVIEW_TARGET_H} aspect)")
-        live_frame.pack(fill="both", expand=True, pady=8)
+        self.live_frame = ttk.LabelFrame(
+            root,
+            text=f"Live View ({LIVEVIEW_TARGET_W}×{LIVEVIEW_TARGET_H} aspect)"
+        )
 
-        live_frame.rowconfigure(0, weight=1)   # image row expands
-        live_frame.rowconfigure(1, weight=0)   # controls row fixed
-        live_frame.rowconfigure(2, weight=0)   # altimeter row
-        live_frame.columnconfigure(0, weight=1)
+        self.live_frame.pack(fill="both", expand=True, pady=8)
 
-        self.live_frame = live_frame
-        self.live_label = tk.Label(live_frame, anchor="center", bg="#202020")
+        self.live_frame.rowconfigure(0, weight=1)
+        self.live_frame.rowconfigure(1, weight=0)
+        self.live_frame.rowconfigure(2, weight=0)
+        self.live_frame.columnconfigure(0, weight=1)
+
+        self.live_label = tk.Label(
+            self.live_frame,
+            anchor="center",
+            bg="#202020"
+        )
         self.live_label.grid(row=0, column=0, sticky="nsew")
 
         # Buttons under live view
-        controls = ttk.Frame(live_frame)
+        controls = ttk.Frame(self.live_frame)
         controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         for i in range(4):
             controls.columnconfigure(i, weight=0)
         controls.columnconfigure(4, weight=1)  # spacer
 
+        self.btn_headless = tk.Button(
+            controls, text="Live View (Headless)",
+            command=self.open_liveview_window, width=22
+        )
+        self.btn_headless.grid(row=0, column=0, padx=6, pady=4, sticky="w")
+
         self.btn_arduino = tk.Button(
             controls, text="Arduino: Retry Connect",
             command=self.retry_arduino_connect, width=22
         )
-        self.btn_arduino.grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        self.btn_arduino.grid(row=0, column=1, padx=6, pady=4, sticky="w")
+
+        self.btn_rotate = tk.Button(
+            controls,
+            text="Rotate 90°",
+            command=self.rotate_liveview,
+            width=14
+        )
+        self.btn_rotate.grid(row=0, column=2, padx=6, pady=4, sticky="w")
 
         ttk.Label(controls, text="").grid(row=0, column=4, sticky="ew")  # spacer
 
@@ -521,6 +537,11 @@ class App(tk.Tk):
         self._liveview_tk = None
         self._last_liveview_mtime = None
         self._last_render_size = (0, 0)
+        self._liveview_rotation = 0
+
+        self.liveview_win = None
+        self.liveview_win_label = None
+        self._liveview_win_tk = None
 
         # camera process tracking
         self.camera_proc = None
@@ -538,6 +559,13 @@ class App(tk.Tk):
         self._last_latest_name = None
         self._last_latest_mtime = None
         self._latest_poll_ms = 300
+
+        def rotate_liveview(self):
+            self._liveview_rotation = (self._liveview_rotation + 90) % 360
+            self._render_cached_to_size()
+
+            if self.liveview_win is not None:
+                self._render_liveview_window()
 
         # Kick off periodic refresh & handle resize events
         self.start_liveview()
@@ -801,6 +829,7 @@ class App(tk.Tk):
                     btn.config(state="normal")
 
         mode = self.camera_mode  # "headless", "gui", or None
+        set_btn(self.btn_headless, active=(mode == "headless"))
         set_btn(self.btn_gui,      active=(mode == "gui"))
 
     # ---------- Latest Image popup ----------
@@ -862,8 +891,17 @@ class App(tk.Tk):
         self._refresh_latest_button()
 
     def _refresh_latest_button(self):
-        # The "Show Latest Image" button has been removed; nothing to update.
-        return
+        open_ = bool(self.latest_win and tk.Toplevel.winfo_exists(self.latest_win))
+        try:
+            if open_:
+                self.btn_latest.config(text="Latest Image: Open", state="disabled",
+                                       bg="#2e7d32", fg="white", activebackground="#2e7d32")
+            else:
+                self.btn_latest.config(text="Show Latest Image", state="normal",
+                                       bg="#b71c1c", fg="white", activebackground="#b71c1c")
+        except Exception:
+            self.btn_latest.config(text=("Latest Image: Open" if open_ else "Show Latest Image"),
+                                   state=("disabled" if open_ else "normal"))
 
     def _schedule_latest_poll(self):
         self._poll_latest_once()
@@ -1029,10 +1067,6 @@ class App(tk.Tk):
     def on_line_received(self, line):
         def ui():
             self.append_log(f"<< {line}")
-            # ACK-gated loop: the Arduino replies "OK TRIGGERED" when a capture
-            # cycle finishes. That reply is what releases the next trigger.
-            if self._trigger_inflight and line.startswith("OK TRIGGERED"):
-                self._on_trigger_ack()
             payload = self._extract_rx_payload(line)
             if payload:
                 self.append_rx(payload)
@@ -1050,7 +1084,7 @@ class App(tk.Tk):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         self._write_line_to_file(f"{ts} [RX] {text}")
 
-    # ---------- Continuous trigger loop (ACK-gated) ----------
+    # ---------- Continuous trigger loop ----------
     def start_loop(self):
         try:
             hold_ms = int(self.trig_time_var.get())
@@ -1063,36 +1097,41 @@ class App(tk.Tk):
                                  "Hold (ms), Interval (ms) and Focus lead (ms) must be valid integers.")
             return
 
+        if interval_ms < hold_ms + focus_ms + 100:
+            if not messagebox.askyesno(
+                "Interval too short",
+                f"Interval ({interval_ms} ms) is shorter than hold + focus lead + 100 ms margin "
+                f"({hold_ms + focus_ms + 100} ms).\n"
+                f"The Arduino is busy for {hold_ms + focus_ms} ms per capture and needs some "
+                "headroom to process the next command.\n\n"
+                "Start anyway?"
+            ):
+                return
+
         self.loop_running = True
-        self._trigger_inflight = False
         self._set_loop_button(True)
-        self.append_log(f"[LOOP] Started: hold={hold_ms} ms, focus lead={focus_ms} ms, "
-                        f"interval={interval_ms} ms (min spacing; waits for ACK each shot)")
+        self.append_log(f"[LOOP] Started: hold={hold_ms} ms, focus lead={focus_ms} ms, interval={interval_ms} ms")
         self._loop_tick()
 
     def stop_loop(self):
         self.loop_running = False
-        self._trigger_inflight = False
         self._set_loop_button(False)
-        for attr in ("loop_job", "_trigger_watchdog_job"):
-            job = getattr(self, attr, None)
-            if job is not None:
-                try:
-                    self.after_cancel(job)
-                except Exception:
-                    pass
-                setattr(self, attr, None)
+        if self.loop_job is not None:
+            try:
+                self.after_cancel(self.loop_job)
+            except Exception:
+                pass
+            self.loop_job = None
         self.append_log("[LOOP] Stopped")
 
     def _loop_tick(self):
         if not self.loop_running:
             return
-        if self._trigger_inflight:
-            return  # previous capture not yet acknowledged; don't stack another
         try:
             hold_ms = int(self.trig_time_var.get())
+            interval_ms = int(self.trig_interval_var.get())
             focus_ms = int(self.focus_lead_var.get())
-            if hold_ms <= 0 or focus_ms < 0:
+            if hold_ms <= 0 or interval_ms <= 0 or focus_ms < 0:
                 raise ValueError
         except Exception:
             self.append_log("[LOOP] Invalid inputs; stopping loop.")
@@ -1102,44 +1141,12 @@ class App(tk.Tk):
         try:
             self.client.send_line(f"TRIGGER_MS {hold_ms} {focus_ms}")
             self.append_log(f">> TRIGGER_MS {hold_ms} {focus_ms}")
-            self._trigger_inflight = True
-            self._trigger_sent_time = time.time()
-            self._trigger_watchdog_job = self.after(self._trigger_timeout_ms, self._trigger_watchdog)
         except Exception as e:
             messagebox.showwarning("Send failed", str(e))
             self.stop_loop()
+            return
 
-    def _on_trigger_ack(self):
-        """Called when the Arduino confirms a capture. Schedules the next one."""
-        if not self._trigger_inflight:
-            return
-        self._trigger_inflight = False
-        if self._trigger_watchdog_job is not None:
-            try:
-                self.after_cancel(self._trigger_watchdog_job)
-            except Exception:
-                pass
-            self._trigger_watchdog_job = None
-        if not self.loop_running:
-            return
-        try:
-            interval_ms = int(self.trig_interval_var.get())
-        except Exception:
-            interval_ms = 1000
-        # interval acts as a MINIMUM spacing: if the capture took longer than the
-        # interval, fire the next immediately; otherwise wait out the remainder.
-        elapsed_ms = (time.time() - self._trigger_sent_time) * 1000.0
-        delay = max(0, int(interval_ms - elapsed_ms))
-        self.loop_job = self.after(delay, self._loop_tick)
-
-    def _trigger_watchdog(self):
-        """Safety net: if an ACK never arrives, don't freeze the loop forever."""
-        self._trigger_watchdog_job = None
-        if not self.loop_running:
-            return
-        self.append_log("[LOOP] No ACK within timeout; sending next anyway.")
-        self._trigger_inflight = False
-        self.loop_job = self.after(0, self._loop_tick)
+        self.loop_job = self.after(interval_ms, self._loop_tick)
 
     def _set_loop_button(self, running: bool):
         if running:
@@ -1155,6 +1162,108 @@ class App(tk.Tk):
                 self.loop_btn.config(text="Start Loop")
 
     # ---------- Live View helpers ----------
+    def rotate_liveview(self):
+        self._liveview_rotation = (self._liveview_rotation + 90) % 360
+        self._render_cached_to_size()
+
+    def open_liveview_window(self):
+       
+        # Zaten açıksa öne getir
+        if self.liveview_win is not None and self.liveview_win.winfo_exists():
+            self.liveview_win.lift()
+            self.liveview_win.focus_force()
+            return
+
+        # Ana GUI'deki Live View bölümünü tamamen kaldır
+        self.live_frame.pack_forget()
+
+        # Ana pencereyi kalan elemanlara göre küçült
+        self.update_idletasks()
+        self.geometry("")
+
+        self.liveview_win = tk.Toplevel(self)
+        self.liveview_win.title("Sony ILX Live View")
+        self.liveview_win.geometry("1200x800")
+        self._apply_icon(self.liveview_win)
+
+        self.liveview_win_label = tk.Label(
+            self.liveview_win,
+            bg="#202020",
+            anchor="center"
+        )
+        self.liveview_win_label.pack(fill="both", expand=True)
+
+        self.liveview_win.bind(
+            "<Configure>",
+            lambda event: self._render_liveview_window()
+        )
+
+        self.liveview_win.protocol(
+            "WM_DELETE_WINDOW",
+            self.close_liveview_window
+        )
+
+        self._render_liveview_window()
+
+
+    def _render_liveview_window(self):
+        try:
+            if self.liveview_win is None:
+                return
+
+            if not self.liveview_win.winfo_exists():
+                return
+
+            if getattr(self, "_last_image_pil", None) is None:
+                return
+
+            w = max(1, self.liveview_win_label.winfo_width())
+            h = max(1, self.liveview_win_label.winfo_height())
+
+            img = self._last_image_pil.rotate(
+                -self._liveview_rotation,
+                expand=True
+            )
+
+            iw, ih = img.size
+
+            scale = min(w / iw, h / ih)
+
+            new_w = max(1, int(iw * scale))
+            new_h = max(1, int(ih * scale))
+
+            img = img.resize(
+                (new_w, new_h),
+                Image.BILINEAR
+            )
+
+            self._liveview_win_tk = ImageTk.PhotoImage(img)
+
+            self.liveview_win_label.config(
+                image=self._liveview_win_tk,
+                text=""
+            )
+
+        except Exception:
+            pass
+    
+    def close_liveview_window(self):
+        if self.liveview_win is not None:
+            try:
+                self.liveview_win.destroy()
+            except Exception:
+                pass
+
+        self.liveview_win = None
+        self.liveview_win_label = None
+        self._liveview_win_tk = None
+        self.live_frame.pack(fill="both", expand=True, pady=8)
+
+    def start_liveview(self):
+        if self._liveview_job is not None:
+            return
+        self._update_liveview()
+
     def start_liveview(self):
         if self._liveview_job is not None:
             return
@@ -1185,7 +1294,15 @@ class App(tk.Tk):
                 return
             if getattr(self, "_last_image_pil", None) is None:
                 return
-            img = self._last_image_pil.resize((target_w, target_h), Image.BILINEAR)  # "paint straight"
+            img = self._last_image_pil.rotate(-self._liveview_rotation, expand=True)
+
+            iw, ih = img.size
+            scale = min(target_w / iw, target_h / ih)
+            new_w = max(1, int(iw * scale))
+            new_h = max(1, int(ih * scale))
+
+            img = img.resize((new_w, new_h), Image.BILINEAR)    
+                        
             self._liveview_tk = ImageTk.PhotoImage(img)
             self.live_label.config(image=self._liveview_tk, text="")
             self._last_render_size = (target_w, target_h)
@@ -1205,6 +1322,8 @@ class App(tk.Tk):
                 self._last_image_pil = img
                 self._last_liveview_mtime = mtime
                 self._render_cached_to_size()
+                if self.liveview_win is not None:
+                    self._render_liveview_window()
             else:
                 target_w, target_h = self._compute_target_box()
                 if (target_w, target_h) != self._last_render_size:
