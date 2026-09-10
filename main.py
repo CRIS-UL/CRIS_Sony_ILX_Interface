@@ -473,7 +473,7 @@ class App(tk.Tk):
             pi_frame,
             text="Seabed alt: -- m",
             font=("Segoe UI", 22, "bold"),
-            foreground="#d4f1a0",
+            foreground="#000000",
         )
         self.pi_dvl_label.pack(anchor="w", padx=8, pady=(2, 8))
 
@@ -1201,6 +1201,11 @@ class App(tk.Tk):
         widget.bind("<ButtonRelease-1>", self._on_liveview_pan_end)
         # Double-click resets the zoom
         widget.bind("<Double-Button-1>", lambda e: self.reset_liveview_zoom())
+        # Show a move cursor so it's clear the image can be dragged around
+        try:
+            widget.config(cursor="fleur")
+        except Exception:
+            pass
 
     def reset_liveview_zoom(self):
         self._liveview_zoom = 1.0
