@@ -469,8 +469,13 @@ class App(tk.Tk):
         self.pi_output.pack(side="left", fill="x", expand=True)
         pi_scroll.config(command=self.pi_output.yview)
 
-        self.pi_dvl_label = ttk.Label(pi_frame, text="Seabed alt: -- m")
-        self.pi_dvl_label.pack(anchor="w", padx=8, pady=(0, 6))
+        self.pi_dvl_label = ttk.Label(
+            pi_frame,
+            text="Seabed alt: -- m",
+            font=("Segoe UI", 22, "bold"),
+            foreground="#d4f1a0",
+        )
+        self.pi_dvl_label.pack(anchor="w", padx=8, pady=(2, 8))
 
         # Pi logger state
         self._pi_running = False
@@ -539,9 +544,24 @@ class App(tk.Tk):
         self._last_render_size = (0, 0)
         self._liveview_rotation = 0
 
+        # Zoom / pan state (shared by the embedded view and the pop-out window)
+        self._liveview_zoom = 1.0          # 1.0 = fit; >1.0 zooms in
+        self._liveview_min_zoom = 1.0
+        self._liveview_max_zoom = 8.0
+        self._liveview_zoom_step = 1.15
+        self._liveview_pan_fx = 0.0        # -0.5..0.5 fraction of pannable range
+        self._liveview_pan_fy = 0.0
+        self._last_pan_extra = (0, 0)      # spare pixels available to pan
+        self._pan_last = None
+
         self.liveview_win = None
         self.liveview_win_label = None
         self._liveview_win_tk = None
+        self.liveview_win_rotate_btn = None
+        self.liveview_win_arduino_btn = None
+
+        # Enable zoom/pan on the embedded live view label
+        self._bind_liveview_zoom(self.live_label)
 
         # camera process tracking
         self.camera_proc = None
@@ -1039,6 +1059,17 @@ class App(tk.Tk):
         except Exception:
             self.btn_arduino.config(text=text, state=state)
 
+        # Mirror the same state on the pop-out Live View window button, if open
+        win_btn = getattr(self, "liveview_win_arduino_btn", None)
+        if win_btn is not None:
+            try:
+                win_btn.config(text=text, state=state, bg=bg, fg="white", activebackground=bg)
+            except Exception:
+                try:
+                    win_btn.config(text=text, state=state)
+                except Exception:
+                    pass
+
 
     # ---------- UI helpers ----------
     def _update_val(self, label, v):
@@ -1164,20 +1195,165 @@ class App(tk.Tk):
     # ---------- Live View helpers ----------
     def rotate_liveview(self):
         self._liveview_rotation = (self._liveview_rotation + 90) % 360
-        self._render_cached_to_size()
+        self._render_active_liveview()
+
+    # ----- Zoom / pan -----
+    def _bind_liveview_zoom(self, widget):
+        """Wire up mouse-wheel zoom and click-drag panning on a live-view label."""
+        # Windows / macOS wheel
+        widget.bind("<MouseWheel>", self._on_liveview_wheel)
+        # Linux wheel (X11 sends button 4/5)
+        widget.bind("<Button-4>", self._on_liveview_wheel)
+        widget.bind("<Button-5>", self._on_liveview_wheel)
+        # Drag to pan
+        widget.bind("<ButtonPress-1>", self._on_liveview_pan_start)
+        widget.bind("<B1-Motion>", self._on_liveview_pan_move)
+        widget.bind("<ButtonRelease-1>", self._on_liveview_pan_end)
+        # Double-click resets the zoom
+        widget.bind("<Double-Button-1>", lambda e: self.reset_liveview_zoom())
+
+    def reset_liveview_zoom(self):
+        self._liveview_zoom = 1.0
+        self._liveview_pan_fx = 0.0
+        self._liveview_pan_fy = 0.0
+        self._render_active_liveview()
+
+    def _on_liveview_wheel(self, event):
+        # Determine zoom direction across platforms
+        if getattr(event, "num", None) == 4:
+            direction = 1
+        elif getattr(event, "num", None) == 5:
+            direction = -1
+        else:
+            direction = 1 if getattr(event, "delta", 0) > 0 else -1
+
+        if direction > 0:
+            new_zoom = self._liveview_zoom * self._liveview_zoom_step
+        else:
+            new_zoom = self._liveview_zoom / self._liveview_zoom_step
+
+        new_zoom = max(self._liveview_min_zoom, min(self._liveview_max_zoom, new_zoom))
+        if abs(new_zoom - self._liveview_zoom) < 1e-6:
+            return
+        self._liveview_zoom = new_zoom
+        if self._liveview_zoom <= self._liveview_min_zoom + 1e-6:
+            # Fully zoomed out: recenter
+            self._liveview_pan_fx = 0.0
+            self._liveview_pan_fy = 0.0
+        self._render_active_liveview()
+        return "break"
+
+    def _on_liveview_pan_start(self, event):
+        self._pan_last = (event.x, event.y)
+
+    def _on_liveview_pan_move(self, event):
+        if self._pan_last is None:
+            return
+        dx = event.x - self._pan_last[0]
+        dy = event.y - self._pan_last[1]
+        self._pan_last = (event.x, event.y)
+
+        extra_x, extra_y = self._last_pan_extra
+        if extra_x > 0:
+            self._liveview_pan_fx = max(
+                -0.5, min(0.5, self._liveview_pan_fx - dx / float(extra_x))
+            )
+        if extra_y > 0:
+            self._liveview_pan_fy = max(
+                -0.5, min(0.5, self._liveview_pan_fy - dy / float(extra_y))
+            )
+        self._render_active_liveview()
+
+    def _on_liveview_pan_end(self, _event=None):
+        self._pan_last = None
+
+    def _render_active_liveview(self):
+        """Repaint whichever live view is currently visible."""
+        if self.liveview_win is not None:
+            self._render_liveview_window()
+        else:
+            self._render_cached_to_size()
+
+    def _render_to_label(self, label, box_w, box_h, fill):
+        """
+        Render the cached live-view image into `label`, honoring the current
+        zoom and pan. `fill=True` scales so the image covers the whole box
+        (no black bars); `fill=False` fits the image inside the box.
+        Returns the PhotoImage (keep a reference) or None.
+        """
+        if getattr(self, "_last_image_pil", None) is None:
+            return None
+
+        img = self._last_image_pil
+        if self._liveview_rotation:
+            img = img.rotate(-self._liveview_rotation, expand=True)
+
+        iw, ih = img.size
+        if iw <= 0 or ih <= 0:
+            return None
+
+        if fill:
+            base = max(box_w / iw, box_h / ih)
+        else:
+            base = min(box_w / iw, box_h / ih)
+
+        scale = base * self._liveview_zoom
+        if scale <= 0:
+            return None
+
+        disp_w = max(1, iw * scale)
+        disp_h = max(1, ih * scale)
+
+        # Visible viewport (in screen px) is the smaller of the box and image
+        view_w = max(1, int(min(box_w, disp_w)))
+        view_h = max(1, int(min(box_h, disp_h)))
+
+        # Spare scaled pixels available to pan across
+        extra_w = disp_w - view_w
+        extra_h = disp_h - view_h
+        self._last_pan_extra = (int(extra_w), int(extra_h))
+
+        # Top-left of the viewport within the scaled image (screen px)
+        off_x = extra_w * (0.5 + self._liveview_pan_fx)
+        off_y = extra_h * (0.5 + self._liveview_pan_fy)
+        off_x = max(0.0, min(off_x, extra_w))
+        off_y = max(0.0, min(off_y, extra_h))
+
+        # Convert the viewport back to a crop box in the ORIGINAL image, so we
+        # only resize the region we actually show (cheap even at high zoom).
+        src_left = off_x / scale
+        src_top = off_y / scale
+        src_w = view_w / scale
+        src_h = view_h / scale
+
+        crop_l = max(0, int(round(src_left)))
+        crop_t = max(0, int(round(src_top)))
+        crop_r = min(iw, int(round(src_left + src_w)))
+        crop_b = min(ih, int(round(src_top + src_h)))
+        if crop_r <= crop_l:
+            crop_r = min(iw, crop_l + 1)
+        if crop_b <= crop_t:
+            crop_b = min(ih, crop_t + 1)
+
+        region = img.crop((crop_l, crop_t, crop_r, crop_b))
+        region = region.resize((view_w, view_h), Image.BILINEAR)
+
+        tk_img = ImageTk.PhotoImage(region)
+        label.config(image=tk_img, text="")
+        return tk_img
 
     def open_liveview_window(self):
-       
-        # Zaten açıksa öne getir
+
+        # If it's already open, just bring it to the front
         if self.liveview_win is not None and self.liveview_win.winfo_exists():
             self.liveview_win.lift()
             self.liveview_win.focus_force()
             return
 
-        # Ana GUI'deki Live View bölümünü tamamen kaldır
+        # Remove the embedded Live View section from the main GUI
         self.live_frame.pack_forget()
 
-        # Ana pencereyi kalan elemanlara göre küçült
+        # Shrink the main window to fit the remaining widgets
         self.update_idletasks()
         self.geometry("")
 
@@ -1186,12 +1362,40 @@ class App(tk.Tk):
         self.liveview_win.geometry("1200x800")
         self._apply_icon(self.liveview_win)
 
+        # Image fills the whole area (no black bars); controls sit on top of it
         self.liveview_win_label = tk.Label(
             self.liveview_win,
-            bg="#202020",
+            bg="#000000",
             anchor="center"
         )
         self.liveview_win_label.pack(fill="both", expand=True)
+
+        # Floating control bar (Arduino connect, Rotate 90, zoom helpers)
+        controls = tk.Frame(self.liveview_win_label, bg="#101010", bd=0)
+        controls.place(relx=1.0, y=8, x=-8, anchor="ne")
+
+        self.liveview_win_arduino_btn = tk.Button(
+            controls, text="Arduino: Retry Connect",
+            command=self.retry_arduino_connect, width=20
+        )
+        self.liveview_win_arduino_btn.pack(side="left", padx=4, pady=4)
+
+        self.liveview_win_rotate_btn = tk.Button(
+            controls, text="Rotate 90°",
+            command=self.rotate_liveview, width=12
+        )
+        self.liveview_win_rotate_btn.pack(side="left", padx=4, pady=4)
+
+        tk.Button(
+            controls, text="Reset Zoom",
+            command=self.reset_liveview_zoom, width=12
+        ).pack(side="left", padx=4, pady=4)
+
+        # Reflect current Arduino connection state on the pop-out button too
+        self._refresh_arduino_button()
+
+        # Mouse-wheel zoom + drag to pan
+        self._bind_liveview_zoom(self.liveview_win_label)
 
         self.liveview_win.bind(
             "<Configure>",
@@ -1220,29 +1424,13 @@ class App(tk.Tk):
             w = max(1, self.liveview_win_label.winfo_width())
             h = max(1, self.liveview_win_label.winfo_height())
 
-            img = self._last_image_pil.rotate(
-                -self._liveview_rotation,
-                expand=True
+            # fill=True so the image covers the whole window (no black bars),
+            # honoring the current zoom/pan.
+            tk_img = self._render_to_label(
+                self.liveview_win_label, w, h, fill=True
             )
-
-            iw, ih = img.size
-
-            scale = min(w / iw, h / ih)
-
-            new_w = max(1, int(iw * scale))
-            new_h = max(1, int(ih * scale))
-
-            img = img.resize(
-                (new_w, new_h),
-                Image.BILINEAR
-            )
-
-            self._liveview_win_tk = ImageTk.PhotoImage(img)
-
-            self.liveview_win_label.config(
-                image=self._liveview_win_tk,
-                text=""
-            )
+            if tk_img is not None:
+                self._liveview_win_tk = tk_img
 
         except Exception:
             pass
@@ -1257,6 +1445,9 @@ class App(tk.Tk):
         self.liveview_win = None
         self.liveview_win_label = None
         self._liveview_win_tk = None
+        self.liveview_win_rotate_btn = None
+        self.liveview_win_arduino_btn = None
+        self._pan_last = None
         self.live_frame.pack(fill="both", expand=True, pady=8)
 
     def start_liveview(self):
@@ -1294,18 +1485,15 @@ class App(tk.Tk):
                 return
             if getattr(self, "_last_image_pil", None) is None:
                 return
-            img = self._last_image_pil.rotate(-self._liveview_rotation, expand=True)
 
-            iw, ih = img.size
-            scale = min(target_w / iw, target_h / ih)
-            new_w = max(1, int(iw * scale))
-            new_h = max(1, int(ih * scale))
-
-            img = img.resize((new_w, new_h), Image.BILINEAR)    
-                        
-            self._liveview_tk = ImageTk.PhotoImage(img)
-            self.live_label.config(image=self._liveview_tk, text="")
-            self._last_render_size = (target_w, target_h)
+            # fill=False keeps the whole frame visible when not zoomed in;
+            # zoom/pan let the user enlarge and move around features.
+            tk_img = self._render_to_label(
+                self.live_label, target_w, target_h, fill=False
+            )
+            if tk_img is not None:
+                self._liveview_tk = tk_img
+                self._last_render_size = (target_w, target_h)
         except Exception:
             pass
 
@@ -1321,13 +1509,14 @@ class App(tk.Tk):
                 img.load()
                 self._last_image_pil = img
                 self._last_liveview_mtime = mtime
-                self._render_cached_to_size()
+                self._render_active_liveview()
+            else:
                 if self.liveview_win is not None:
                     self._render_liveview_window()
-            else:
-                target_w, target_h = self._compute_target_box()
-                if (target_w, target_h) != self._last_render_size:
-                    self._render_cached_to_size()
+                else:
+                    target_w, target_h = self._compute_target_box()
+                    if (target_w, target_h) != self._last_render_size:
+                        self._render_cached_to_size()
         except FileNotFoundError:
             self.live_label.config(text=f"Waiting for live view:\n{LIVEVIEW_PATH}", image="")
             self._liveview_tk = None
