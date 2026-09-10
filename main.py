@@ -545,8 +545,10 @@ class App(tk.Tk):
         self._liveview_rotation = 0
 
         # Zoom / pan state (shared by the embedded view and the pop-out window)
-        self._liveview_zoom = 1.0          # 1.0 = fit; >1.0 zooms in
-        self._liveview_min_zoom = 1.0
+        self._liveview_zoom = 1.0          # 1.0 = default; >1.0 zooms in
+        # Allow zooming below 1.0 so a rotated image can be shrunk to fit the
+        # whole frame on screen (otherwise a rotated portrait image overfills).
+        self._liveview_min_zoom = 0.2
         self._liveview_max_zoom = 8.0
         self._liveview_zoom_step = 1.15
         self._liveview_pan_fx = 0.0        # -0.5..0.5 fraction of pannable range
@@ -1206,15 +1208,8 @@ class App(tk.Tk):
         self._liveview_pan_fy = 0.0
         self._render_active_liveview()
 
-    def _on_liveview_wheel(self, event):
-        # Determine zoom direction across platforms
-        if getattr(event, "num", None) == 4:
-            direction = 1
-        elif getattr(event, "num", None) == 5:
-            direction = -1
-        else:
-            direction = 1 if getattr(event, "delta", 0) > 0 else -1
-
+    def _apply_zoom(self, direction):
+        """Zoom in (direction>0) or out (direction<0) by one step."""
         if direction > 0:
             new_zoom = self._liveview_zoom * self._liveview_zoom_step
         else:
@@ -1229,6 +1224,22 @@ class App(tk.Tk):
             self._liveview_pan_fx = 0.0
             self._liveview_pan_fy = 0.0
         self._render_active_liveview()
+
+    def zoom_in_liveview(self):
+        self._apply_zoom(1)
+
+    def zoom_out_liveview(self):
+        self._apply_zoom(-1)
+
+    def _on_liveview_wheel(self, event):
+        # Determine zoom direction across platforms
+        if getattr(event, "num", None) == 4:
+            direction = 1
+        elif getattr(event, "num", None) == 5:
+            direction = -1
+        else:
+            direction = 1 if getattr(event, "delta", 0) > 0 else -1
+        self._apply_zoom(direction)
         return "break"
 
     def _on_liveview_pan_start(self, event):
@@ -1365,6 +1376,21 @@ class App(tk.Tk):
             controls, text="Reset Zoom",
             command=self.reset_liveview_zoom, width=12
         ).pack(side="left", padx=4, pady=4)
+
+        # Zoom in/out buttons in the top-right corner
+        tk.Button(
+            controls, text="＋", font=("Segoe UI", 12, "bold"),
+            command=self.zoom_in_liveview, width=3
+        ).pack(side="right", padx=(2, 6), pady=4)
+
+        tk.Button(
+            controls, text="－", font=("Segoe UI", 12, "bold"),
+            command=self.zoom_out_liveview, width=3
+        ).pack(side="right", padx=2, pady=4)
+
+        tk.Label(
+            controls, text="Zoom:", bg="#101010", fg="#d4f1a0"
+        ).pack(side="right", padx=(6, 2))
 
         # Image fills the remaining area (no black bars beside it)
         self.liveview_win_label = tk.Label(
