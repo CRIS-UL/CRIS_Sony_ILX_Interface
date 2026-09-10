@@ -558,7 +558,6 @@ class App(tk.Tk):
         self.liveview_win_label = None
         self._liveview_win_tk = None
         self.liveview_win_rotate_btn = None
-        self.liveview_win_arduino_btn = None
 
         # Enable zoom/pan on the embedded live view label
         self._bind_liveview_zoom(self.live_label)
@@ -1059,17 +1058,6 @@ class App(tk.Tk):
         except Exception:
             self.btn_arduino.config(text=text, state=state)
 
-        # Mirror the same state on the pop-out Live View window button, if open
-        win_btn = getattr(self, "liveview_win_arduino_btn", None)
-        if win_btn is not None:
-            try:
-                win_btn.config(text=text, state=state, bg=bg, fg="white", activebackground=bg)
-            except Exception:
-                try:
-                    win_btn.config(text=text, state=state)
-                except Exception:
-                    pass
-
 
     # ---------- UI helpers ----------
     def _update_val(self, label, v):
@@ -1362,23 +1350,10 @@ class App(tk.Tk):
         self.liveview_win.geometry("1200x800")
         self._apply_icon(self.liveview_win)
 
-        # Image fills the whole area (no black bars); controls sit on top of it
-        self.liveview_win_label = tk.Label(
-            self.liveview_win,
-            bg="#000000",
-            anchor="center"
-        )
-        self.liveview_win_label.pack(fill="both", expand=True)
-
-        # Floating control bar (Arduino connect, Rotate 90, zoom helpers)
-        controls = tk.Frame(self.liveview_win_label, bg="#101010", bd=0)
-        controls.place(relx=1.0, y=8, x=-8, anchor="ne")
-
-        self.liveview_win_arduino_btn = tk.Button(
-            controls, text="Arduino: Retry Connect",
-            command=self.retry_arduino_connect, width=20
-        )
-        self.liveview_win_arduino_btn.pack(side="left", padx=4, pady=4)
+        # Top toolbar (kept separate from the image so it never flickers over
+        # the live view). Arduino connect stays on the MAIN screen only.
+        controls = tk.Frame(self.liveview_win, bg="#101010", bd=0)
+        controls.pack(side="top", fill="x")
 
         self.liveview_win_rotate_btn = tk.Button(
             controls, text="Rotate 90°",
@@ -1391,8 +1366,13 @@ class App(tk.Tk):
             command=self.reset_liveview_zoom, width=12
         ).pack(side="left", padx=4, pady=4)
 
-        # Reflect current Arduino connection state on the pop-out button too
-        self._refresh_arduino_button()
+        # Image fills the remaining area (no black bars beside it)
+        self.liveview_win_label = tk.Label(
+            self.liveview_win,
+            bg="#000000",
+            anchor="center"
+        )
+        self.liveview_win_label.pack(fill="both", expand=True)
 
         # Mouse-wheel zoom + drag to pan
         self._bind_liveview_zoom(self.liveview_win_label)
@@ -1446,7 +1426,6 @@ class App(tk.Tk):
         self.liveview_win_label = None
         self._liveview_win_tk = None
         self.liveview_win_rotate_btn = None
-        self.liveview_win_arduino_btn = None
         self._pan_last = None
         self.live_frame.pack(fill="both", expand=True, pady=8)
 
