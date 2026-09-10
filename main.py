@@ -369,10 +369,6 @@ class App(tk.Tk):
                                  command=self.restart_camera_with_gui, width=22)
         self.btn_gui.pack(side="left", padx=6)
 
-        self.btn_latest = tk.Button(trig_ctrl, text="Show Latest Image",
-                                    command=self.toggle_latest_window, width=22)
-        self.btn_latest.pack(side="left", padx=6)
-
         # BlueROV state defaults — always initialised so the rest of the app
         # (e.g. on_close) is safe whether or not the controls are enabled.
         self._pending_heading = None
@@ -912,6 +908,9 @@ class App(tk.Tk):
         self._refresh_latest_button()
 
     def _refresh_latest_button(self):
+        # The "Show Latest Image" button was removed; nothing to refresh.
+        if getattr(self, "btn_latest", None) is None:
+            return
         open_ = bool(self.latest_win and tk.Toplevel.winfo_exists(self.latest_win))
         try:
             if open_:
