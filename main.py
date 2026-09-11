@@ -143,6 +143,11 @@ def get_json(url: str, timeout: float = 2.0):
     return json.loads(body)
 
 
+# Sentinel marking an argument that was not supplied (distinct from an explicit
+# None, which means "clear this reading").
+_UNSET = object()
+
+
 class HeadingDial(tk.Canvas):
     """Circular heading wheel: click/drag to pick a heading (0-359 deg)."""
 
@@ -467,7 +472,7 @@ class App(tk.Tk):
 
         self.pi_dvl_label = ttk.Label(
             pi_frame,
-            text="Seabed alt: -- m",
+            text="Seabed alt: -- m  |  Depth: -- m",
             font=("Segoe UI", 22, "bold"),
             foreground="#000000",
         )
@@ -482,6 +487,7 @@ class App(tk.Tk):
         self._mav_thread = None
         self._mav_running = False
         self._seabed_alt = None
+        self._seabed_depth = None
         self._seabed_alt_lock = threading.Lock()
 
         # -------------------- Live View panel --------------------
@@ -700,7 +706,7 @@ class App(tk.Tk):
 
     def _start_mavlink_probe(self):
         if mavutil is None:
-            self._update_seabed_alt_label(None)
+            self._update_seabed_alt_label(alt=None, depth=None)
             self.append_log("[MAVLink] pymavlink not installed; direct seabed altitude disabled")
             return
         if self._mav_running:
@@ -741,22 +747,34 @@ class App(tk.Tk):
 
             last_seen = time.time()
             while self._mav_running:
-                msg = conn.recv_match(type="RANGEFINDER", blocking=True, timeout=2)
+                msg = conn.recv_match(
+                    type=["RANGEFINDER", "GLOBAL_POSITION_INT"],
+                    blocking=True,
+                    timeout=2
+                )
                 if not self._mav_running:
                     break
                 if msg is None:
                     if time.time() - last_seen > 5.0:
-                        self._update_seabed_alt_label(None)
+                        self._update_seabed_alt_label(alt=None, depth=None)
                     continue
                 last_seen = time.time()
-                if hasattr(msg, "distance"):
-                    distance = float(msg.distance)
+                mtype = msg.get_type()
+                if mtype == "RANGEFINDER" and hasattr(msg, "distance"):
+                    distance = float(msg.distance)          # metres off seabed
                     with self._seabed_alt_lock:
                         self._seabed_alt = distance
-                    self._update_seabed_alt_label(distance)
+                    self._update_seabed_alt_label(alt=distance)
+                elif mtype == "GLOBAL_POSITION_INT" and hasattr(msg, "relative_alt"):
+                    # relative_alt is mm relative to home (surface); negative when
+                    # submerged, so depth (positive down) = -relative_alt.
+                    depth = -float(msg.relative_alt) / 1000.0
+                    with self._seabed_alt_lock:
+                        self._seabed_depth = depth
+                    self._update_seabed_alt_label(depth=depth)
         except Exception as e:
             self.append_log(f"[MAVLink] Error: {e}")
-            self._update_seabed_alt_label(None)
+            self._update_seabed_alt_label(alt=None, depth=None)
         finally:
             if conn is not None:
                 try:
@@ -765,12 +783,24 @@ class App(tk.Tk):
                     pass
             self._mav_running = False
 
-    def _update_seabed_alt_label(self, distance):
+    def _update_seabed_alt_label(self, alt=_UNSET, depth=_UNSET):
+        # Update seabed altitude and/or depth independently; whichever arg is
+        # left unset keeps its last value so partial updates don't clear the
+        # other reading.
+        with self._seabed_alt_lock:
+            if alt is not _UNSET:
+                self._seabed_alt = alt
+            if depth is not _UNSET:
+                self._seabed_depth = depth
+            cur_alt = self._seabed_alt
+            cur_depth = self._seabed_depth
+
+        alt_text = "Seabed alt: -- m" if cur_alt is None else f"Seabed alt: {cur_alt:.3f} m"
+        depth_text = "Depth: -- m" if cur_depth is None else f"Depth: {cur_depth:.3f} m"
+        text = f"{alt_text}  |  {depth_text}"
+
         def ui():
-            if distance is None:
-                self.pi_dvl_label.config(text="Seabed alt: -- m")
-            else:
-                self.pi_dvl_label.config(text=f"Seabed alt: {distance:.3f} m")
+            self.pi_dvl_label.config(text=text)
         self.after(0, ui)
 
     def _write_stop_file(self):
