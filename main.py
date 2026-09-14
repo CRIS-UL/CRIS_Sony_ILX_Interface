@@ -208,6 +208,98 @@ class HeadingDial(tk.Canvas):
         self.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="#e53935", outline="")
 
 
+class NavCompass(tk.Canvas):
+    """Read-only compass rose: fixed N-up card with a red needle and heading
+    bug showing the current heading. Cardinal (N/E/S/W) and intercardinal
+    (NE/SE/SW/NW) labels, degree ticks, and a numeric readout below."""
+
+    def __init__(self, master, size=220, **kwargs):
+        kwargs.setdefault("bg", "#0d0d0d")
+        kwargs.setdefault("highlightthickness", 0)
+        super().__init__(master, width=size, height=size + 26, **kwargs)
+        self.size = size
+        self.center = (size / 2, size / 2)
+        self.radius = size / 2 - 24
+        self.heading = None
+        self._draw()
+
+    def set_heading(self, deg):
+        self.heading = None if deg is None else float(deg) % 360
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        cx, cy = self.center
+        r = self.radius
+
+        # outer ring
+        self.create_oval(cx - r, cy - r, cx + r, cy + r,
+                         outline="#3a3a3a", width=2, fill="#0a0a0a")
+        self.create_oval(cx - r + 7, cy - r + 7, cx + r - 7, cy + r - 7,
+                         outline="#1f1f1f", width=1)
+
+        # degree ticks: major every 90, medium every 30, minor every 15
+        for deg in range(0, 360, 15):
+            rad = math.radians(deg - 90)
+            if deg % 90 == 0:
+                length, col, w = 15, "#8a8a8a", 2
+            elif deg % 30 == 0:
+                length, col, w = 10, "#5a5a5a", 1
+            else:
+                length, col, w = 6, "#3a3a3a", 1
+            x1 = cx + (r - length) * math.cos(rad)
+            y1 = cy + (r - length) * math.sin(rad)
+            x2 = cx + r * math.cos(rad)
+            y2 = cy + r * math.sin(rad)
+            self.create_line(x1, y1, x2, y2, fill=col, width=w)
+
+        # cardinal + intercardinal labels
+        labels = (
+            (0, "N", "#e53935", True), (90, "E", "#d4f1a0", True),
+            (180, "S", "#d4f1a0", True), (270, "W", "#d4f1a0", True),
+            (45, "NE", "#8a8a8a", False), (135, "SE", "#8a8a8a", False),
+            (225, "SW", "#8a8a8a", False), (315, "NW", "#8a8a8a", False),
+        )
+        for deg, txt, col, big in labels:
+            rad = math.radians(deg - 90)
+            lx = cx + (r - 26) * math.cos(rad)
+            ly = cy + (r - 26) * math.sin(rad)
+            self.create_text(lx, ly, text=txt, fill=col,
+                             font=("Segoe UI", 12 if big else 8,
+                                   "bold" if big else "normal"))
+
+        # fixed lubber marker at the top (points down into the ring)
+        self.create_polygon(cx - 8, cy - r - 3, cx + 8, cy - r - 3, cx, cy - r + 11,
+                            fill="#ffb300", outline="")
+
+        if self.heading is None:
+            self.create_text(cx, cy, text="no\nheading", fill="#666666",
+                             font=("Segoe UI", 11), justify="center")
+            self.create_text(cx, cy + r + 14, text="HDG ---",
+                             fill="#888888", font=("Consolas", 13, "bold"))
+            return
+
+        rad = math.radians(self.heading - 90)
+        # white tail
+        tx = cx - (r - 44) * math.cos(rad)
+        ty = cy - (r - 44) * math.sin(rad)
+        self.create_line(cx, cy, tx, ty, fill="#eeeeee", width=3)
+        # red needle toward heading
+        nx = cx + (r - 30) * math.cos(rad)
+        ny = cy + (r - 30) * math.sin(rad)
+        self.create_line(cx, cy, nx, ny, fill="#e53935", width=4,
+                         arrow="last", arrowshape=(16, 20, 7))
+        # heading bug on the ring
+        bx = cx + r * math.cos(rad)
+        by = cy + r * math.sin(rad)
+        self.create_oval(bx - 5, by - 5, bx + 5, by + 5,
+                         fill="#e53935", outline="#ffffff")
+        # hub + numeric readout
+        self.create_oval(cx - 5, cy - 5, cx + 5, cy + 5, fill="#e53935", outline="")
+        self.create_text(cx, cy + r + 14, text=f"HDG {self.heading:03.0f}°",
+                         fill="#ffffff", font=("Consolas", 13, "bold"))
+
+
 class TcpClient:
     def __init__(self, on_line):
         self.sock = None
@@ -483,12 +575,39 @@ class App(tk.Tk):
         self._pi_ssh = None
         self._pi_thread = None
 
-        # Direct MAVLink seabed altitude state
+        # Direct MAVLink navigation state (seabed alt, depth, heading, speed...)
         self._mav_thread = None
         self._mav_running = False
-        self._seabed_alt = None
-        self._seabed_depth = None
-        self._seabed_alt_lock = threading.Lock()
+        self._nav_lock = threading.Lock()
+        self._nav_state = {
+            "seabed_alt": None,
+            "depth": None,
+            "heading": None,
+            "speed": None,
+            "pitch": None,
+            "roll": None,
+        }
+
+        # Shared readout variables for the navigation panel (work in both the
+        # embedded panel and the popped-out window).
+        self.nav_heading_var = tk.StringVar(value="---")
+        self.nav_depth_var = tk.StringVar(value="-- m")
+        self.nav_seabed_var = tk.StringVar(value="-- m")
+        self.nav_speed_var = tk.StringVar(value="-- m/s")
+        self.nav_pitch_var = tk.StringVar(value="--")
+        self.nav_roll_var = tk.StringVar(value="--")
+
+        # Navigation panel dock/pop-out state
+        self.nav_win = None
+        self._nav_compass = None          # currently active compass widget
+        self._nav_compass_embedded = None
+
+        # Build the embedded navigation panel under the seabed/depth readout.
+        self.nav_frame = ttk.LabelFrame(pi_frame, text="Navigation")
+        self.nav_frame.pack(fill="x", padx=6, pady=(0, 6))
+        self._nav_compass_embedded = self._build_nav_widgets(self.nav_frame, popped=False)
+        self._nav_compass = self._nav_compass_embedded
+        self._refresh_nav_ui()
 
         # -------------------- Live View panel --------------------
         self.live_frame = ttk.LabelFrame(
@@ -706,7 +825,8 @@ class App(tk.Tk):
 
     def _start_mavlink_probe(self):
         if mavutil is None:
-            self._update_seabed_alt_label(alt=None, depth=None)
+            self._update_nav(seabed_alt=None, depth=None, heading=None,
+                             speed=None, pitch=None, roll=None)
             self.append_log("[MAVLink] pymavlink not installed; direct seabed altitude disabled")
             return
         if self._mav_running:
@@ -748,7 +868,8 @@ class App(tk.Tk):
             last_seen = time.time()
             while self._mav_running:
                 msg = conn.recv_match(
-                    type=["RANGEFINDER", "GLOBAL_POSITION_INT"],
+                    type=["RANGEFINDER", "GLOBAL_POSITION_INT",
+                          "VFR_HUD", "ATTITUDE"],
                     blocking=True,
                     timeout=2
                 )
@@ -756,25 +877,46 @@ class App(tk.Tk):
                     break
                 if msg is None:
                     if time.time() - last_seen > 5.0:
-                        self._update_seabed_alt_label(alt=None, depth=None)
+                        self._update_nav(seabed_alt=None, depth=None, heading=None,
+                                         speed=None, pitch=None, roll=None)
                     continue
                 last_seen = time.time()
                 mtype = msg.get_type()
                 if mtype == "RANGEFINDER" and hasattr(msg, "distance"):
-                    distance = float(msg.distance)          # metres off seabed
-                    with self._seabed_alt_lock:
-                        self._seabed_alt = distance
-                    self._update_seabed_alt_label(alt=distance)
-                elif mtype == "GLOBAL_POSITION_INT" and hasattr(msg, "relative_alt"):
-                    # relative_alt is mm relative to home (surface); negative when
-                    # submerged, so depth (positive down) = -relative_alt.
-                    depth = -float(msg.relative_alt) / 1000.0
-                    with self._seabed_alt_lock:
-                        self._seabed_depth = depth
-                    self._update_seabed_alt_label(depth=depth)
+                    # metres off the seabed
+                    self._update_nav(seabed_alt=float(msg.distance))
+                elif mtype == "GLOBAL_POSITION_INT":
+                    updates = {}
+                    if hasattr(msg, "relative_alt"):
+                        # relative_alt is mm relative to home (surface); negative
+                        # when submerged, so depth (positive down) = -relative_alt.
+                        updates["depth"] = -float(msg.relative_alt) / 1000.0
+                    # hdg is heading in centidegrees (0..35999); 65535 = unknown.
+                    hdg = getattr(msg, "hdg", 65535)
+                    if hdg not in (None, 65535):
+                        updates["heading"] = float(hdg) / 100.0
+                    if hasattr(msg, "vx") and hasattr(msg, "vy"):
+                        # vx/vy are cm/s in the NED frame -> horizontal speed m/s
+                        updates["speed"] = math.hypot(msg.vx, msg.vy) / 100.0
+                    if updates:
+                        self._update_nav(**updates)
+                elif mtype == "VFR_HUD":
+                    updates = {}
+                    if hasattr(msg, "heading"):
+                        updates["heading"] = float(msg.heading) % 360
+                    if hasattr(msg, "groundspeed"):
+                        updates["speed"] = float(msg.groundspeed)
+                    if updates:
+                        self._update_nav(**updates)
+                elif mtype == "ATTITUDE":
+                    self._update_nav(
+                        pitch=math.degrees(msg.pitch),
+                        roll=math.degrees(msg.roll),
+                    )
         except Exception as e:
             self.append_log(f"[MAVLink] Error: {e}")
-            self._update_seabed_alt_label(alt=None, depth=None)
+            self._update_nav(seabed_alt=None, depth=None, heading=None,
+                             speed=None, pitch=None, roll=None)
         finally:
             if conn is not None:
                 try:
@@ -783,25 +925,123 @@ class App(tk.Tk):
                     pass
             self._mav_running = False
 
-    def _update_seabed_alt_label(self, alt=_UNSET, depth=_UNSET):
-        # Update seabed altitude and/or depth independently; whichever arg is
-        # left unset keeps its last value so partial updates don't clear the
-        # other reading.
-        with self._seabed_alt_lock:
-            if alt is not _UNSET:
-                self._seabed_alt = alt
-            if depth is not _UNSET:
-                self._seabed_depth = depth
-            cur_alt = self._seabed_alt
-            cur_depth = self._seabed_depth
+    def _update_nav(self, **kwargs):
+        # Merge the supplied navigation readings into the shared state and
+        # schedule a UI refresh. Only keys passed here change; pass an explicit
+        # None to clear a reading (e.g. on signal loss). Safe to call from the
+        # MAVLink thread.
+        with self._nav_lock:
+            for key, value in kwargs.items():
+                if key in self._nav_state:
+                    self._nav_state[key] = value
+        self.after(0, self._refresh_nav_ui)
 
-        alt_text = "Seabed alt: -- m" if cur_alt is None else f"Seabed alt: {cur_alt:.3f} m"
-        depth_text = "Depth: -- m" if cur_depth is None else f"Depth: {cur_depth:.3f} m"
-        text = f"{alt_text}  |  {depth_text}"
+    def _refresh_nav_ui(self):
+        # Runs on the Tk main thread. Updates the big seabed/depth label, the
+        # navigation readout variables, and the active compass.
+        with self._nav_lock:
+            st = dict(self._nav_state)
 
-        def ui():
-            self.pi_dvl_label.config(text=text)
-        self.after(0, ui)
+        alt = st["seabed_alt"]
+        depth = st["depth"]
+        heading = st["heading"]
+        speed = st["speed"]
+        pitch = st["pitch"]
+        roll = st["roll"]
+
+        alt_text = "Seabed alt: -- m" if alt is None else f"Seabed alt: {alt:.3f} m"
+        depth_text = "Depth: -- m" if depth is None else f"Depth: {depth:.3f} m"
+        self.pi_dvl_label.config(text=f"{alt_text}  |  {depth_text}")
+
+        self.nav_heading_var.set("---" if heading is None else f"{heading:03.0f}°")
+        self.nav_depth_var.set("-- m" if depth is None else f"{depth:.2f} m")
+        self.nav_seabed_var.set("-- m" if alt is None else f"{alt:.2f} m")
+        self.nav_speed_var.set("-- m/s" if speed is None else f"{speed:.2f} m/s")
+        self.nav_pitch_var.set("--" if pitch is None else f"{pitch:+.1f}°")
+        self.nav_roll_var.set("--" if roll is None else f"{roll:+.1f}°")
+
+        if self._nav_compass is not None:
+            try:
+                if self._nav_compass.winfo_exists():
+                    self._nav_compass.set_heading(heading)
+            except Exception:
+                pass
+
+    def _build_nav_widgets(self, parent, popped):
+        """Build the compass + readout grid inside `parent`. Returns the
+        NavCompass so the caller can track which one is currently active.
+        The readouts use shared StringVars, so both the embedded panel and the
+        popped-out window stay live from the same MAVLink updates."""
+        wrap = tk.Frame(parent, bg="#0d0d0d")
+        wrap.pack(fill="both", expand=True, padx=6, pady=6)
+
+        compass = NavCompass(wrap, size=220)
+        compass.pack(side="left", padx=(4, 16), pady=4)
+
+        right = tk.Frame(wrap, bg="#0d0d0d")
+        right.pack(side="left", fill="both", expand=True)
+
+        rows = (
+            ("Heading", self.nav_heading_var),
+            ("Depth", self.nav_depth_var),
+            ("Seabed alt", self.nav_seabed_var),
+            ("Speed", self.nav_speed_var),
+            ("Pitch", self.nav_pitch_var),
+            ("Roll", self.nav_roll_var),
+        )
+        for i, (name, var) in enumerate(rows):
+            tk.Label(right, text=name, fg="#9a9a9a", bg="#0d0d0d",
+                     font=("Segoe UI", 12), anchor="w", width=11).grid(
+                         row=i, column=0, sticky="w", pady=3)
+            tk.Label(right, textvariable=var, fg="#d4f1a0", bg="#0d0d0d",
+                     font=("Consolas", 18, "bold"), anchor="w").grid(
+                         row=i, column=1, sticky="w", pady=3, padx=(6, 0))
+
+        if popped:
+            btn_text, cmd = "▣ Dock in Main Window", self.close_nav_window
+        else:
+            btn_text, cmd = "⧉ Pop Out", self.open_nav_window
+        tk.Button(right, text=btn_text, command=cmd, width=20).grid(
+            row=len(rows), column=0, columnspan=2, sticky="w", pady=(14, 2))
+
+        return compass
+
+    def open_nav_window(self):
+        # Already open? Just raise it.
+        if self.nav_win is not None and self.nav_win.winfo_exists():
+            self.nav_win.lift()
+            self.nav_win.focus_force()
+            return
+
+        # Remove the embedded panel from the main window.
+        self.nav_frame.pack_forget()
+        self.update_idletasks()
+        self.geometry("")
+
+        self.nav_win = tk.Toplevel(self)
+        self.nav_win.title("Navigation")
+        self.nav_win.configure(bg="#0d0d0d")
+        self.nav_win.geometry("560x340")
+        self._apply_icon(self.nav_win)
+
+        container = tk.Frame(self.nav_win, bg="#0d0d0d")
+        container.pack(fill="both", expand=True)
+        self._nav_compass = self._build_nav_widgets(container, popped=True)
+
+        self.nav_win.protocol("WM_DELETE_WINDOW", self.close_nav_window)
+        self._refresh_nav_ui()
+
+    def close_nav_window(self):
+        if self.nav_win is not None:
+            try:
+                self.nav_win.destroy()
+            except Exception:
+                pass
+        self.nav_win = None
+        # Re-dock: the embedded compass becomes the active one again.
+        self._nav_compass = self._nav_compass_embedded
+        self.nav_frame.pack(fill="x", padx=6, pady=(0, 6))
+        self._refresh_nav_ui()
 
     def _write_stop_file(self):
         try:
