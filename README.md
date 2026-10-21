@@ -16,6 +16,7 @@ A Windows-oriented Python/Tkinter application to control an **Aquorea Mk3** stro
 - [How things work](#how-things-work)
   - [TCP (Aquorea/Arduino)](#tcp-aquoreaarduino)
   - [Camera control (Sony SDK)](#camera-control-sony-sdk)
+  - [Survey trigger relay (BlueROV control software)](#survey-trigger-relay-bluerov-control-software)
   - [Live View](#live-view)
   - [Latest Image popup](#latest-image-popup)
   - [Exposure logging + image pairing](#exposure-logging--image-pairing)
@@ -176,6 +177,25 @@ IMAGE_PATTERN       = r"^DSC(\d+)\.(jpg)$"   # case-insensitive
 - **GUI mode**: launches `RemoteCli.exe 1`.
 - **Restart** buttons create `stop.txt`, wait briefly for exit, then relaunch in the chosen mode.
 - All **stdout lines** from the camera app are timestamped into the session log.
+
+### Survey trigger relay (BlueROV control software)
+
+The Arduino serves one TCP client at a time, and this app is it. So the
+BlueROV control software (ControlSoftware-BlueROV) takes the photos of a path
+plan through this app: it runs a small HTTP relay on
+`http://127.0.0.1:9100` (`TRIGGER_RELAY_*` near the top of `main.py`).
+
+- `POST /trigger` `{"hold_ms": 100, "focus_ms": 750}` sends
+  `TRIGGER_MS <hold_ms> <focus_ms>` over this app's Arduino connection (the
+  same line as the trigger loop, logged with `(survey)`) and replies once the
+  Arduino says `OK TRIGGERED`.
+- `GET /status` → `{"arduino": true/false, "loop": true/false}`.
+
+In the control software set **Camera link** to `http://127.0.0.1:9100`. Stop
+this app's own trigger loop while a survey runs: the Arduino drops commands
+that arrive mid-capture, so the relay refuses (409) while the loop is on. If
+the control software runs on another computer, set
+`TRIGGER_RELAY_HOST = "0.0.0.0"` and use this computer's IP there.
 
 ### Live View
 

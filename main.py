@@ -12,6 +12,7 @@ import math
 import json
 import urllib.request
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # --- Pillow for JPEG rendering ---
@@ -107,6 +108,16 @@ DEFAULT_DEPTH_STEP_M = 0.5       # default depth nudge per tap (m)
 DEPTH_STATUS_POLL_MS = 1000      # how often to poll current depth for the readout
 
 # Match DSCXXXXX.JPG and capture the number as group(1)
+# Survey trigger relay: the BlueROV control software takes the photos of a
+# path plan through this program, because the Arduino only serves one TCP
+# client (this one). It POSTs {"hold_ms", "focus_ms"} to /trigger; the same
+# TRIGGER_MS line the loop sends goes out over our connection, and the reply
+# waits for the Arduino's OK TRIGGERED. GET /status says if we're connected.
+# In the control software set Camera link to http://127.0.0.1:9100.
+TRIGGER_RELAY_ENABLED = True
+TRIGGER_RELAY_HOST = "127.0.0.1"   # "0.0.0.0" if the control software runs on another computer
+TRIGGER_RELAY_PORT = 9100
+
 IMAGE_PATTERN = re.compile(r"^DSC(\d+)\.(jpg)$", re.IGNORECASE)
 # ------------------------------------------------------
 
@@ -209,6 +220,7 @@ class TcpClient:
         self.alive = False
         self.rx_thread = None
         self.on_line = on_line
+        self._send_lock = threading.Lock()  # the GUI and the trigger relay both send
 
     def connect(self, host, port):
         self.close()
@@ -258,7 +270,8 @@ class TcpClient:
             data = text.encode()
         else:
             data = (text + "\n").encode()
-        self.sock.sendall(data)
+        with self._send_lock:
+            self.sock.sendall(data)
 
     def close(self):
         self.alive = False
@@ -272,6 +285,59 @@ class TcpClient:
             except Exception:
                 pass
         self.sock = None
+
+
+class TriggerRelay:
+    """Small HTTP server that lets the BlueROV control software trigger the
+    camera over this program's Arduino connection (see TRIGGER_RELAY_*)."""
+
+    def __init__(self, app, host, port):
+        relay_app = app
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path.rstrip("/") == "/status":
+                    self._reply(200, {"ok": True, "arduino": relay_app._arduino_connected(),
+                                      "loop": bool(relay_app.loop_running)})
+                else:
+                    self._reply(404, {"ok": False, "msg": "not found"})
+
+            def do_POST(self):
+                if self.path.rstrip("/") != "/trigger":
+                    self._reply(404, {"ok": False, "msg": "not found"})
+                    return
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    d = json.loads(self.rfile.read(n) or b"{}")
+                    hold_ms = int(d.get("hold_ms", 100))
+                    focus_ms = int(d.get("focus_ms", FOCUS_LEAD_MS))
+                except (ValueError, TypeError):
+                    self._reply(400, {"ok": False, "msg": "bad request"})
+                    return
+                code, obj = relay_app.relay_trigger(hold_ms, focus_ms)
+                self._reply(code, obj)
+
+            def log_message(self, *args):
+                pass  # every trigger is in the session log already
+
+        self.server = ThreadingHTTPServer((host, port), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True, name="Trigger-Relay").start()
+
+    def close(self):
+        try:
+            self.server.shutdown()
+            self.server.server_close()
+        except Exception:
+            pass
 
 
 class App(tk.Tk):
@@ -590,6 +656,17 @@ class App(tk.Tk):
 
         self.client = TcpClient(self.on_line_received)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # --- Survey trigger relay for the BlueROV control software ---
+        self._relay_ack = threading.Event()
+        self._relay_lock = threading.Lock()
+        self.trigger_relay = None
+        if TRIGGER_RELAY_ENABLED:
+            try:
+                self.trigger_relay = TriggerRelay(self, TRIGGER_RELAY_HOST, TRIGGER_RELAY_PORT)
+                self.append_log(f"[RELAY] Survey trigger relay on http://{TRIGGER_RELAY_HOST}:{TRIGGER_RELAY_PORT}")
+            except OSError as e:
+                self.append_log(f"[RELAY] Could not start the survey trigger relay: {e}")
 
         # Camera app is no longer auto-started; it launches only when the user
         # presses "Live View (Headless)" or "Show Camera GUI".
@@ -1085,6 +1162,10 @@ class App(tk.Tk):
 
     # ---------- Incoming TCP lines ----------
     def on_line_received(self, line):
+        # (RX thread) a relayed trigger waits for this
+        if line == "OK TRIGGERED":
+            self._relay_ack.set()
+
         def ui():
             self.append_log(f"<< {line}")
             payload = self._extract_rx_payload(line)
@@ -1535,6 +1616,34 @@ class App(tk.Tk):
         finally:
             self._liveview_job = self.after(LIVEVIEW_REFRESH_MS, self._update_liveview)
 
+    # ---------- Survey trigger relay (BlueROV control software) ----------
+    def relay_trigger(self, hold_ms, focus_ms):
+        """One TRIGGER_MS from the control software (relay thread). Returns
+        (HTTP code, reply) once the Arduino has replied OK TRIGGERED."""
+        if not (1 <= hold_ms <= 10000 and 0 <= focus_ms <= 5000):
+            return 400, {"ok": False, "msg": "hold 1-10000 ms, focus lead 0-5000 ms"}
+        if not self._arduino_connected():
+            return 503, {"ok": False, "msg": "the CRIS interface is not connected to the Arduino"}
+        if self.loop_running:
+            # the Arduino drops commands that arrive mid-capture: one sender at a time
+            return 409, {"ok": False, "msg": "the trigger loop is running in the CRIS interface: stop it first"}
+        if not self._relay_lock.acquire(blocking=False):
+            return 409, {"ok": False, "msg": "busy: the last photo is still being taken"}
+        try:
+            self._relay_ack.clear()
+            cmd = f"TRIGGER_MS {hold_ms} {focus_ms}"
+            try:
+                self.client.send_line(cmd)
+            except Exception as e:
+                return 503, {"ok": False, "msg": f"send failed: {e}"}
+            self.append_log(f">> {cmd} (survey)")
+            ack = self._relay_ack.wait(focus_ms / 1000.0 + hold_ms / 1000.0 + 2.0)
+            if not ack:
+                self.append_log("[RELAY] No OK TRIGGERED from the Arduino")
+            return 200, {"ok": ack, "ack": ack, "msg": "OK TRIGGERED" if ack else "no reply from the Arduino"}
+        finally:
+            self._relay_lock.release()
+
     # ---------- Sending ----------
     def send_cmd(self, s):
         try:
@@ -1879,6 +1988,9 @@ class App(tk.Tk):
 
         # Stop Pi logger
         self.stop_pi_logger()
+
+        if self.trigger_relay is not None:
+            self.trigger_relay.close()
 
         # Close TCP client and exit
         self.client.close()
