@@ -1,10 +1,12 @@
 import os
 import sys
+import csv
+import queue
 import subprocess
 import socket
 import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import datetime
 import time
 import re
@@ -17,6 +19,10 @@ from pathlib import Path
 # --- Pillow for JPEG rendering ---
 from PIL import Image, ImageTk
 from io import BytesIO
+
+# --- Sony camera, called in-process through SonyCam.dll ---
+import sony_camera
+from sony_camera import SonyCamera, SonyCameraError
 
 # --- pymavlink for direct seabed altitude probing ---
 try:
@@ -69,15 +75,23 @@ APP_ICON_PNG = "cris_logo.png"      # optional fallback for non-Windows (if avai
 
 # Sony SDK paths — absolute so the app works when double-clicked from Explorer
 _RELEASE_DIR = get_app_dir() / "Release"
-DEFAULT_IMAGE_DIR = str(_RELEASE_DIR)
+# SonyCam.dll (built from the Sony_SDK repo) sits here beside Cr_Core.dll + CrAdapter/
+SONYCAM_LIB_DIR = str(_RELEASE_DIR)
+# Default folder the camera's PC copies are saved (and renamed) in; changeable in the GUI
+DEFAULT_IMAGE_DIR = str(get_app_dir() / "images")
+IMAGE_LOG_FILENAME = "image_log.csv"  # one row per saved image, in the save folder
+CAMERA_CONNECT_TIMEOUT_MS = 10000
+
+# Legacy: the standalone RemoteCli.exe camera GUI ("Show Camera GUI" button)
 CAMERA_APP_EXE = str(_RELEASE_DIR / "RemoteCli.exe")
 
 # Stop flag file for the external camera app
 STOP_FILE_PATH = str(_RELEASE_DIR / "stop.txt")
 
 # Live View settings
-LIVEVIEW_PATH = str(_RELEASE_DIR / "LiveView000000.JPG")
-LIVEVIEW_REFRESH_MS = 50  # ~20 checks/sec; repaints only on mtime change
+LIVEVIEW_PATH = str(_RELEASE_DIR / "LiveView000000.JPG")  # only written by RemoteCli.exe
+LIVEVIEW_REFRESH_MS = 50  # ~20 checks/sec; repaints only when a new frame arrives
+LIVEVIEW_POLL_S = 0.03    # how often the camera thread asks SonyCam for a frame
 LIVEVIEW_TARGET_W = 1024
 LIVEVIEW_TARGET_H = 680
 LIVEVIEW_ASPECT = LIVEVIEW_TARGET_W / LIVEVIEW_TARGET_H
@@ -108,6 +122,15 @@ DEPTH_STATUS_POLL_MS = 1000      # how often to poll current depth for the reado
 
 # Match DSCXXXXX.JPG and capture the number as group(1)
 IMAGE_PATTERN = re.compile(r"^DSC(\d+)\.(jpg)$", re.IGNORECASE)
+
+# Camera settings shown as dropdowns: (SonyCam setting id, label)
+CAMERA_SETTINGS = [
+    (sony_camera.SETTING_EXPOSURE_MODE, "Mode"),
+    (sony_camera.SETTING_SHUTTER_SPEED, "Shutter"),
+    (sony_camera.SETTING_APERTURE, "Aperture"),
+    (sony_camera.SETTING_ISO, "ISO"),
+    (sony_camera.SETTING_FOCUS_MODE, "Focus"),
+]
 # ------------------------------------------------------
 
 
@@ -278,7 +301,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Strobe / Lamp / Camera Controller (TCP) Aquorea Mk3 / Sony ILX")
-        self.geometry("1100x800")
+        self.geometry("1100x900")
 
         # Keep a reference to any PhotoImage used for icons to prevent GC
         self._icon_img = None
@@ -368,6 +391,58 @@ class App(tk.Tk):
         self.btn_gui = tk.Button(trig_ctrl, text="Show Camera GUI",
                                  command=self.restart_camera_with_gui, width=22)
         self.btn_gui.pack(side="left", padx=6)
+
+        # -------------------- Sony camera (in-process via SonyCam.dll) --------------------
+        cam_frame = ttk.LabelFrame(root, text="Sony Camera")
+        cam_frame.pack(fill="x", pady=6)
+
+        cam_row = ttk.Frame(cam_frame); cam_row.pack(fill="x", padx=6, pady=4)
+        self.btn_cam_connect = tk.Button(cam_row, text="Connect Camera",
+                                         command=self.toggle_camera_connection, width=18)
+        self.btn_cam_connect.pack(side="left")
+        self.cam_status_var = tk.StringVar(value="Not connected")
+        ttk.Label(cam_row, textvariable=self.cam_status_var, width=28).pack(side="left", padx=8)
+
+        self.btn_cam_capture = tk.Button(cam_row, text="Capture", width=10,
+                                         command=self.capture_camera)
+        self.btn_cam_capture.pack(side="left", padx=4)
+
+        ttk.Label(cam_row, text="Save to:").pack(side="left", padx=(12, 2))
+        self.store_dest_var = tk.StringVar(value="")
+        self.store_dest_combo = ttk.Combobox(cam_row, textvariable=self.store_dest_var,
+                                             values=sony_camera.STORE_DESTINATIONS,
+                                             state="readonly", width=12)
+        self.store_dest_combo.pack(side="left")
+        self.store_dest_combo.bind("<<ComboboxSelected>>", self._on_store_dest_selected)
+
+        set_row = ttk.Frame(cam_frame); set_row.pack(fill="x", padx=6, pady=4)
+        self.setting_combos = {}
+        self._setting_writable = {}
+        for kind, label in CAMERA_SETTINGS:
+            ttk.Label(set_row, text=f"{label}:").pack(side="left", padx=(0, 2))
+            combo = ttk.Combobox(set_row, state="disabled", width=10)
+            combo.pack(side="left", padx=(0, 10))
+            combo.bind("<<ComboboxSelected>>", lambda _e, k=kind: self._on_setting_selected(k))
+            self.setting_combos[kind] = combo
+        ttk.Button(set_row, text="Refresh",
+                   command=self.refresh_camera_settings).pack(side="left")
+        self.last_image_var = tk.StringVar(value="")
+        ttk.Label(set_row, textvariable=self.last_image_var,
+                  foreground="#555555").pack(side="left", padx=(12, 0))
+
+        name_row = ttk.Frame(cam_frame); name_row.pack(fill="x", padx=6, pady=(4, 6))
+        ttk.Label(name_row, text="Image folder:").pack(side="left")
+        self.save_dir_var = tk.StringVar(value=DEFAULT_IMAGE_DIR)
+        ttk.Entry(name_row, textvariable=self.save_dir_var, width=36).pack(side="left", padx=4)
+        ttk.Button(name_row, text="Browse...", command=self.browse_save_folder).pack(side="left")
+
+        self.img_rename_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(name_row, text="Rename", variable=self.img_rename_var).pack(side="left", padx=(12, 2))
+        ttk.Label(name_row, text="Prefix:").pack(side="left")
+        self.img_prefix_var = tk.StringVar(value="")
+        ttk.Entry(name_row, textvariable=self.img_prefix_var, width=12).pack(side="left", padx=4)
+        self.img_alt_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(name_row, text="Add seabed alt", variable=self.img_alt_var).pack(side="left", padx=4)
 
         # BlueROV state defaults — always initialised so the rest of the app
         # (e.g. on_close) is safe whether or not the controls are enabled.
@@ -560,6 +635,27 @@ class App(tk.Tk):
         # Enable zoom/pan on the embedded live view label
         self._bind_liveview_zoom(self.live_label)
 
+        # In-process Sony camera (SonyCam.dll). Its callbacks run on SDK
+        # threads, so they only queue events for the Tk thread to handle.
+        self._cam_events = queue.Queue()
+        self.camera = SonyCamera(
+            SONYCAM_LIB_DIR,
+            on_log=lambda line: self._cam_events.put(("log", line)),
+            on_image=lambda path: self._cam_events.put(
+                ("image", path, datetime.datetime.now())),
+        )
+        self._cam_busy = False            # connect/disconnect in progress
+        self._cam_connected = False
+        self._lv_thread = None
+        self._lv_running = False
+        self._lv_lock = threading.Lock()
+        self._lv_frame = None             # latest live view JPEG bytes
+        self._lv_frame_seq = 0
+        self._lv_shown_seq = -1
+        self._last_saved_image = None
+        self._recent_image_names = {}     # camera stem -> (time, alt, seen): keeps RAW+JPG pairs together
+        self._cam_events_job = None
+
         # camera process tracking
         self.camera_proc = None
         self._camera_lock = threading.Lock()
@@ -607,8 +703,12 @@ class App(tk.Tk):
         # Let the user know where logs are going
         self.append_log(f"[INFO] Writing logs to: {os.path.abspath(self.run_log_path)}")
 
+        # Handle events queued by the Sony camera callbacks/workers
+        self._drain_camera_events()
+
         # Initialize GUI button colors/states
         self._refresh_camera_buttons()
+        self._refresh_sony_controls()
         self._refresh_latest_button()
 
     # ---------- Icon helper (applies to any window) ----------
@@ -804,20 +904,34 @@ class App(tk.Tk):
         threading.Thread(target=worker, daemon=True, name="RestartHeadless").start()
 
     def restart_camera_with_gui(self):
-        """Stop current instance via stop.txt, then start with arg=1 (GUI)."""
+        """Release the in-process camera, then start RemoteCli.exe with arg=1 (GUI)."""
         def worker():
-            self._write_stop_file()
-            deadline = time.time() + 2.0
-            with self._camera_lock:
-                proc = self.camera_proc
-            if proc is not None:
-                while time.time() < deadline:
-                    if proc.poll() is not None:
-                        break
-                    time.sleep(0.1)
-            self._remove_stop_file()
+            # Only one program can hold the camera at a time
+            self._stop_live_view_thread()
+            self.camera.disconnect()
+            self._cam_events.put(("disconnected", "Released for RemoteCli.exe GUI"))
+            self._stop_camera_exe()
             self.start_camera(headless=False)
         threading.Thread(target=worker, daemon=True, name="RestartGUI").start()
+
+    def _stop_camera_exe(self):
+        """Stop RemoteCli.exe if it is running (blocking; call from a worker)."""
+        with self._camera_lock:
+            proc = self.camera_proc
+        if proc is None or proc.poll() is not None:
+            return
+        self._write_stop_file()
+        deadline = time.time() + 2.0
+        while time.time() < deadline and proc.poll() is None:
+            time.sleep(0.1)
+        if proc.poll() is None:
+            # The exe's GUI mode does not watch stop.txt
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        self._remove_stop_file()
 
     def _schedule_camera_status_poll(self):
         self._poll_camera_status()
@@ -848,6 +962,305 @@ class App(tk.Tk):
         mode = self.camera_mode  # "headless", "gui", or None
         set_btn(self.btn_headless, active=(mode == "headless"))
         set_btn(self.btn_gui,      active=(mode == "gui"))
+
+    # ---------- Sony camera (in-process via SonyCam.dll) ----------
+    def _run_camera_task(self, name, fn):
+        """Run a blocking camera call off the Tk thread; errors go to the log."""
+        def worker():
+            try:
+                fn()
+            except Exception as e:
+                self._cam_events.put(("log", f"{name} failed: {e}"))
+        threading.Thread(target=worker, daemon=True, name=f"SonyCam-{name}").start()
+
+    def toggle_camera_connection(self):
+        if self._cam_busy:
+            return
+        if self._cam_connected:
+            self.disconnect_camera()
+        else:
+            self.connect_camera()
+
+    def connect_camera(self):
+        self._cam_busy = True
+        self.cam_status_var.set("Connecting...")
+        self._refresh_sony_controls()
+        save_dir = self.save_dir_var.get().strip() or DEFAULT_IMAGE_DIR
+
+        def worker():
+            try:
+                self._stop_camera_exe()
+                self.camera.load()
+                self.camera.connect(timeout_ms=CAMERA_CONNECT_TIMEOUT_MS)
+                self.camera.set_save_folder(save_dir)
+                try:
+                    dest = self.camera.get_store_destination()
+                except SonyCameraError:
+                    dest = None
+                self._cam_events.put(("connected", self.camera.model(), dest))
+                self._read_camera_settings()
+                self._start_live_view_thread()
+            except Exception as e:
+                try:
+                    self.camera.disconnect()
+                except Exception:
+                    pass
+                self._cam_events.put(("connect_failed", str(e)))
+        threading.Thread(target=worker, daemon=True, name="SonyCam-Connect").start()
+
+    def disconnect_camera(self):
+        self._cam_busy = True
+        self.cam_status_var.set("Disconnecting...")
+        self._refresh_sony_controls()
+
+        def worker():
+            self._stop_live_view_thread()
+            try:
+                self.camera.disconnect()
+            finally:
+                self._cam_events.put(("disconnected", "Not connected"))
+        threading.Thread(target=worker, daemon=True, name="SonyCam-Disconnect").start()
+
+    def capture_camera(self):
+        self._run_camera_task("Capture", self.camera.capture)
+
+    def browse_save_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.save_dir_var.get() or DEFAULT_IMAGE_DIR,
+                                         title="Folder for camera images")
+        if not folder:
+            return
+        self.save_dir_var.set(folder)
+        if self._cam_connected:
+            self._run_camera_task("Set save folder", lambda: self.camera.set_save_folder(folder))
+        self.append_log(f"[SonyCam] Image folder: {folder}")
+
+    def _on_store_dest_selected(self, _event=None):
+        index = self.store_dest_combo.current()
+        if index < 0 or not self._cam_connected:
+            return
+        self._run_camera_task("Set store destination",
+                              lambda: self.camera.set_store_destination(index))
+
+    def _on_setting_selected(self, kind):
+        index = self.setting_combos[kind].current()
+        if index < 0 or not self._cam_connected:
+            return
+
+        def task():
+            self.camera.set_setting(kind, index)
+            time.sleep(0.3)  # let the camera apply it before reading back
+            # One change can alter the others (e.g. mode limits shutter/aperture)
+            self._read_camera_settings()
+        self._run_camera_task("Set setting", task)
+
+    def refresh_camera_settings(self):
+        if self._cam_connected:
+            self._run_camera_task("Read settings", self._read_camera_settings)
+
+    def _read_camera_settings(self):
+        """Read every dropdown's value from the camera (worker thread)."""
+        for kind, _label in CAMERA_SETTINGS:
+            try:
+                current, options, writable = self.camera.get_setting(kind)
+            except SonyCameraError:
+                current, options, writable = "", [], False
+            self._cam_events.put(("setting", kind, current, options, writable))
+
+    # Live view: a worker thread pulls frames from SonyCam; the Tk loop paints them
+    def _start_live_view_thread(self):
+        if self._lv_thread is not None and self._lv_thread.is_alive():
+            return
+        self._lv_running = True
+        self._lv_thread = threading.Thread(target=self._live_view_loop, daemon=True,
+                                           name="SonyCam-LiveView")
+        self._lv_thread.start()
+
+    def _stop_live_view_thread(self):
+        self._lv_running = False
+        t = self._lv_thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2.0)
+        self._lv_thread = None
+        with self._lv_lock:
+            self._lv_frame = None
+
+    def _live_view_loop(self):
+        errors = 0
+        lost = False
+        while self._lv_running:
+            try:
+                frame = self.camera.get_live_view()
+                errors = 0
+                if lost:
+                    lost = False
+                    self._cam_events.put(("status", f"Connected: {self.camera.model()}"))
+                    self._cam_events.put(("log", "Camera connection restored"))
+                if frame:
+                    with self._lv_lock:
+                        self._lv_frame = frame
+                        self._lv_frame_seq += 1
+            except SonyCameraError as e:
+                if e.code == -4:
+                    # The SDK reconnects by itself (CrReconnecting_ON); keep polling
+                    if not lost:
+                        lost = True
+                        with self._lv_lock:
+                            self._lv_frame = None
+                        self._cam_events.put(("status", "Connection lost - reconnecting..."))
+                        self._cam_events.put(("log", "Camera connection lost; waiting for it to reconnect"))
+                    time.sleep(0.5)
+                    continue
+                errors += 1
+                if errors == 1 or errors % 100 == 0:
+                    self._cam_events.put(("log", f"Live view: {e}"))
+                time.sleep(0.2)
+                continue
+            time.sleep(LIVEVIEW_POLL_S)
+        self._lv_running = False
+
+    def _drain_camera_events(self):
+        try:
+            while True:
+                ev = self._cam_events.get_nowait()
+                kind = ev[0]
+                if kind == "log":
+                    self.append_log(f"[SonyCam] {ev[1]}")
+                elif kind == "image":
+                    self._handle_new_image(ev[1], ev[2])
+                elif kind == "connected":
+                    _, model, dest = ev
+                    self._cam_busy = False
+                    self._cam_connected = True
+                    self.cam_status_var.set(f"Connected: {model}")
+                    if dest is not None and 0 <= dest < len(sony_camera.STORE_DESTINATIONS):
+                        self.store_dest_combo.current(dest)
+                        if dest == 1:
+                            self.append_log("[SonyCam] Store destination is Camera only: "
+                                            "images will not reach the PC to be renamed")
+                    self.append_log(f"[SonyCam] Connected to {model}")
+                elif kind == "connect_failed":
+                    self._cam_busy = False
+                    self._cam_connected = False
+                    self.cam_status_var.set("Not connected")
+                    self.append_log(f"[SonyCam] Connect failed: {ev[1]}")
+                    messagebox.showerror("Camera", f"Could not connect to the camera:\n{ev[1]}")
+                elif kind == "disconnected":
+                    self._cam_busy = False
+                    self._cam_connected = False
+                    self.cam_status_var.set(ev[1])
+                    self.append_log(f"[SonyCam] {ev[1]}")
+                    for combo in self.setting_combos.values():
+                        combo.set("")
+                    self._setting_writable.clear()
+                elif kind == "status":
+                    if self._cam_connected:
+                        self.cam_status_var.set(ev[1])
+                elif kind == "setting":
+                    _, setting, current, options, writable = ev
+                    combo = self.setting_combos[setting]
+                    combo.config(values=options)
+                    combo.set(current)
+                    self._setting_writable[setting] = writable
+                self._refresh_sony_controls()
+        except queue.Empty:
+            pass
+        self._cam_events_job = self.after(100, self._drain_camera_events)
+
+    def _refresh_sony_controls(self):
+        connected = self._cam_connected
+        if self._cam_busy:
+            self.btn_cam_connect.config(state="disabled")
+        elif connected:
+            self.btn_cam_connect.config(text="Disconnect Camera", state="normal",
+                                        bg="#2e7d32", fg="white", activebackground="#2e7d32")
+        else:
+            self.btn_cam_connect.config(text="Connect Camera", state="normal",
+                                        bg="#b71c1c", fg="white", activebackground="#b71c1c")
+        self.btn_cam_capture.config(state=("normal" if connected else "disabled"))
+        self.store_dest_combo.config(state=("readonly" if connected else "disabled"))
+        for kind, combo in self.setting_combos.items():
+            writable = self._setting_writable.get(kind, False)
+            combo.config(state=("readonly" if connected and writable else "disabled"))
+
+    # Saved images: rename with timestamp (+ seabed altitude) and log to CSV
+    def _handle_new_image(self, path, arrived):
+        src = Path(path)
+        if not src.is_absolute():
+            src = Path(self.save_dir_var.get() or DEFAULT_IMAGE_DIR) / src
+        with self._seabed_alt_lock:
+            alt = self._seabed_alt
+
+        # RAW+JPEG arrive as two files with the same camera name: give both
+        # the same timestamp/altitude so they stay paired after renaming.
+        stem = src.stem.upper()
+        now = time.time()
+        self._recent_image_names = {k: v for k, v in self._recent_image_names.items()
+                                    if now - v[2] < 10.0}
+        if stem in self._recent_image_names:
+            arrived, alt, _ = self._recent_image_names[stem]
+        else:
+            self._recent_image_names[stem] = (arrived, alt, now)
+
+        meta = {
+            "saved_at": arrived.isoformat(timespec="milliseconds"),
+            "camera_file": src.name,
+            "seabed_alt_m": "" if alt is None else f"{alt:.3f}",
+            "strobe_intensity": self.lbl_strobe.cget("text"),
+            "lamp_intensity": self.lbl_lamp.cget("text"),
+        }
+        for kind, label in CAMERA_SETTINGS:
+            meta[label.lower()] = self.setting_combos[kind].get()
+
+        dest = self._build_image_path(src, arrived, alt) if self.img_rename_var.get() else src
+        self._rename_image(src, dest, meta, attempt=0)
+
+    def _build_image_path(self, src, when, alt):
+        """<prefix>_<YYYYmmdd_HHMMSS_mmm>[_alt<x.xx>m]_<camera name>.<ext>"""
+        parts = []
+        prefix = re.sub(r"[^A-Za-z0-9._-]+", "-", self.img_prefix_var.get().strip()).strip("-")
+        if prefix:
+            parts.append(prefix)
+        parts.append(when.strftime("%Y%m%d_%H%M%S_") + f"{when.microsecond // 1000:03d}")
+        if self.img_alt_var.get() and alt is not None:
+            parts.append(f"alt{alt:.2f}m")
+        parts.append(src.stem)
+        dest = src.with_name("_".join(parts) + src.suffix)
+        n = 1
+        while dest.exists():
+            dest = src.with_name("_".join(parts) + f"_{n}" + src.suffix)
+            n += 1
+        return dest
+
+    def _rename_image(self, src, dest, meta, attempt):
+        if dest != src:
+            try:
+                os.replace(src, dest)
+            except OSError as e:
+                # The file can still be held open for a moment after the transfer
+                if attempt < 10 and src.exists():
+                    self.after(200, lambda: self._rename_image(src, dest, meta, attempt + 1))
+                    return
+                self.append_log(f"[SonyCam] Could not rename {src.name}: {e}")
+                dest = src
+        meta["file"] = dest.name
+        self._append_image_log(dest.parent, meta)
+        self._last_saved_image = str(dest)
+        self.last_image_var.set(f"Last: {dest.name}")
+        self.append_log(f"[SonyCam] Saved {meta['camera_file']} -> {dest}")
+
+    def _append_image_log(self, folder, meta):
+        fields = ["saved_at", "file", "camera_file", "seabed_alt_m",
+                  "strobe_intensity", "lamp_intensity"] + [label.lower() for _k, label in CAMERA_SETTINGS]
+        path = Path(folder) / IMAGE_LOG_FILENAME
+        try:
+            new_file = not path.exists()
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                if new_file:
+                    w.writeheader()
+                w.writerow(meta)
+        except Exception as e:
+            self.append_log(f"[SonyCam] Could not write {path}: {e}")
 
     # ---------- Latest Image popup ----------
     def toggle_latest_window(self):
@@ -930,14 +1343,14 @@ class App(tk.Tk):
     def _poll_latest_once(self):
         if not (self.latest_win and tk.Toplevel.winfo_exists(self.latest_win)):
             return
-        folder = Path(DEFAULT_IMAGE_DIR)
+        folder = Path(self.save_dir_var.get() or DEFAULT_IMAGE_DIR)
         try:
-            newest = self._find_newest_image(folder)
+            newest = self._latest_saved_image() or self._find_newest_image(folder)
         except Exception:
             newest = None
         if newest is None:
             if self._latest_label:
-                self._latest_label.config(text=f"No DSC*.JPG found in:\n{folder}")
+                self._latest_label.config(text=f"No images saved yet in:\n{folder}")
             return
 
         name, path, mtime = newest
@@ -957,6 +1370,13 @@ class App(tk.Tk):
         else:
             # re-render if window size changed
             self._render_latest_cached()
+
+    def _latest_saved_image(self):
+        """(name, full_path, mtime) of the last JPEG the camera saved this session, or None."""
+        path = self._last_saved_image
+        if not path or not path.lower().endswith((".jpg", ".jpeg")) or not os.path.exists(path):
+            return None
+        return (os.path.basename(path), path, os.stat(path).st_mtime)
 
     def _find_newest_image(self, folder: Path):
         """Return (name, full_path, mtime) of the highest-numbered DSCXXXXX.JPG, or None."""
@@ -1508,32 +1928,52 @@ class App(tk.Tk):
 
     def _update_liveview(self):
         try:
-            st = os.stat(LIVEVIEW_PATH)
-            mtime = st.st_mtime
-            need_reload = (self._last_liveview_mtime != mtime)
-            if need_reload:
-                with open(LIVEVIEW_PATH, "rb") as f:
-                    data = f.read()
+            if self.camera_mode == "gui":
+                # RemoteCli.exe GUI owns the camera and writes frames to a file
+                data = self._read_liveview_file()
+                have_source = os.path.exists(LIVEVIEW_PATH)
+                waiting_text = f"Waiting for live view:\n{LIVEVIEW_PATH}"
+            else:
+                with self._lv_lock:
+                    frame, seq = self._lv_frame, self._lv_frame_seq
+                data = frame if (frame is not None and seq != self._lv_shown_seq) else None
+                self._lv_shown_seq = seq
+                have_source = frame is not None
+                waiting_text = ("Waiting for live view..." if self._cam_connected
+                                else "Camera not connected.\nPress \"Connect Camera\".")
+
+            if not have_source:
+                self.live_label.config(text=waiting_text, image="")
+                self._liveview_tk = None
+                self._last_image_pil = None
+            elif data is not None:
                 img = Image.open(BytesIO(data))
                 img.load()
                 self._last_image_pil = img
-                self._last_liveview_mtime = mtime
                 self._render_active_liveview()
+            elif self.liveview_win is not None:
+                self._render_liveview_window()
             else:
-                if self.liveview_win is not None:
-                    self._render_liveview_window()
-                else:
-                    target_w, target_h = self._compute_target_box()
-                    if (target_w, target_h) != self._last_render_size:
-                        self._render_cached_to_size()
-        except FileNotFoundError:
-            self.live_label.config(text=f"Waiting for live view:\n{LIVEVIEW_PATH}", image="")
-            self._liveview_tk = None
-            self._last_image_pil = None
+                target_w, target_h = self._compute_target_box()
+                if (target_w, target_h) != self._last_render_size:
+                    self._render_cached_to_size()
         except Exception:
             pass
         finally:
             self._liveview_job = self.after(LIVEVIEW_REFRESH_MS, self._update_liveview)
+
+    def _read_liveview_file(self):
+        """New bytes of RemoteCli.exe's LiveView000000.JPG, or None if unchanged/missing."""
+        try:
+            mtime = os.stat(LIVEVIEW_PATH).st_mtime
+        except FileNotFoundError:
+            return None
+        if self._last_liveview_mtime == mtime:
+            return None
+        with open(LIVEVIEW_PATH, "rb") as f:
+            data = f.read()
+        self._last_liveview_mtime = mtime
+        return data
 
     # ---------- Sending ----------
     def send_cmd(self, s):
@@ -1821,6 +2261,19 @@ class App(tk.Tk):
         try:
             with open(STOP_FILE_PATH, "w") as f:
                 f.write("stop")
+        except Exception:
+            pass
+
+        # Release the in-process camera (SonyCam.dll)
+        if self._cam_events_job is not None:
+            try:
+                self.after_cancel(self._cam_events_job)
+            except Exception:
+                pass
+            self._cam_events_job = None
+        self._stop_live_view_thread()
+        try:
+            self.camera.close()
         except Exception:
             pass
 

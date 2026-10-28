@@ -31,9 +31,11 @@ A Windows-oriented Python/Tkinter application to control an **Aquorea Mk3** stro
 
 - **Strobe/Lamp control** via TCP commands (intensity 0–100)  
 - **Trigger loop** (ms hold & interval) with safety prompts  
-- **Sony SDK integration**: start **headless live view** or **full GUI** by launching your compiled `RemoteCli.exe`  
-- **Live View panel** (smooth, aspect-correct repaint on file mtime change)  
-- **Latest Image** window that auto-tracks highest numbered `DSCxxxxx.JPG`  
+- **Sony SDK integration (in-process)**: the GUI loads `SonyCam.dll` and calls the camera directly: connect, capture, live view, store destination, mode/shutter/aperture/ISO/focus  
+- **Automatic image renaming**: every image the camera saves to the PC is renamed with a prefix, timestamp and seabed altitude, and logged to `image_log.csv`  
+- **Live View panel** (frames straight from the camera, no temp files)  
+- **Latest Image** window that shows the last image the camera saved  
+- Legacy **Show Camera GUI** button still launches `RemoteCli.exe 1` (the OpenCV camera GUI)  
 - **Exposure logging** to CSV and **auto-pairing** to images within a time tolerance  
 - **Blue Robotics Ping1D** altimeter over **UDP or serial** with confidence readout  
 - **Session log file** per run (timestamps, commands, camera stdout)  
@@ -172,21 +174,51 @@ IMAGE_PATTERN       = r"^DSC(\d+)\.(jpg)$"   # case-insensitive
 
 ### Camera control (Sony SDK)
 
-- **Headless live view**: launches `RemoteCli.exe` with **no args**.
-- **GUI mode**: launches `RemoteCli.exe 1`.
-- **Restart** buttons create `stop.txt`, wait briefly for exit, then relaunch in the chosen mode.
-- All **stdout lines** from the camera app are timestamped into the session log.
+The camera code from the `Sony_SDK` repo is built as a shared library, `SonyCam.dll`
+(CMake target `SonyCam`, C API in `app/SonyCamApi.h`). `sony_camera.py` loads it with
+`ctypes`, so the GUI calls the camera directly instead of running `RemoteCli.exe` as a
+black box.
+
+- **Setup:** build `SonyCam` (see the Sony_SDK README) and copy `SonyCam.dll` into
+  `Release/` next to `Cr_Core.dll`, the OpenCV DLLs and `CrAdapter/` (`SONYCAM_LIB_DIR`).
+- **Sony Camera panel:**
+  - **Connect Camera**: loads the DLL, connects to the first camera and starts live view.
+  - **Capture**: fires the shutter from the PC (hardware triggers from the Arduino still work as before).
+  - **Save to**: the camera's still image store destination (PC / Camera / PC + Camera).
+    Images are only renamed when they reach the PC, so use **PC** or **PC + Camera**.
+  - **Mode / Shutter / Aperture / ISO / Focus**: read from the camera on connect, and set
+    when you pick a value (greyed out when the camera won't allow a change, e.g. the dial
+    position decides). **Refresh** re-reads them.
+- Everything the camera code logs goes to the session log with a `[SonyCam]` tag.
+- **Show Camera GUI** releases the in-process connection and launches `RemoteCli.exe 1`
+  (only one program can hold the camera). Press **Connect Camera** to take it back.
+
+### Image naming
+
+When the camera finishes transferring an image to the PC, the SDK reports its path
+(`OnCompleteDownload`) and the GUI immediately renames it in the **Image folder**:
+
+```
+<prefix>_<YYYYmmdd_HHMMSS_mmm>_alt<seabed alt>m_<camera name>.<ext>
+e.g.  DIVE-01_20261028_142233_517_alt1.23m_DSC01234.JPG
+```
+
+- The timestamp is the PC clock when the file arrived (a fraction of a second after the shot).
+- RAW + JPEG from the same shot get the same timestamp, so they stay paired.
+- Untick **Rename** to keep the camera's names; untick **Add seabed alt** to leave the altitude out.
+- Every image (renamed or not) gets a row in `image_log.csv` in the image folder:
+  `saved_at, file, camera_file, seabed_alt_m, strobe_intensity, lamp_intensity, mode, shutter, aperture, iso, focus`.
 
 ### Live View
 
-- The app watches `LIVEVIEW_PATH` for **mtime changes** about ~20×/sec.
-- On change, it reloads and resizes to a **1024×680 aspect** box inside the panel.
-- Resizing the window repaints the cached image without reloading from disk.
+- While connected, a background thread fetches live view JPEGs from `SonyCam.dll` and the
+  panel repaints whenever a new frame arrives, resized to a **1024×680 aspect** box.
+- While the legacy `RemoteCli.exe` GUI is running, the panel shows its `LIVEVIEW_PATH` file instead.
 
 ### Latest Image popup
 
-- A separate window that always shows the **highest-numbered** `DSCxxxxx.JPG` in `DEFAULT_IMAGE_DIR`.
-- It polls the folder and only repaints when a new filename appears or on resize.
+- Shows the last JPEG the camera saved this session (falls back to the highest-numbered
+  `DSCxxxxx.JPG` in the image folder).
 
 ### Exposure logging + image pairing
 
@@ -222,16 +254,23 @@ pyinstaller --onefile --windowed --name CRIS_Sony_ILX_Interface --icon "app.ico"
 
 > The code uses a `resource_path()` helper for PyInstaller (`sys._MEIPASS`) so bundled files (e.g., the manual) resolve correctly.
 
+`SonyCam.dll` and the Sony SDK runtime are not bundled into the exe: keep them in a
+`Release/` folder next to `CRIS_Sony_ILX_Interface.exe` (as for `RemoteCli.exe`).
+
 ---
 
 ## Troubleshooting
 
-**Live View doesn’t update**
-- Confirm `LIVEVIEW_PATH` exists and is being written by your camera app.
-- Check session log for `[RemoteCLI]` lines; try **Live View (Headless)** again.
+**Connect Camera fails**
+- `SonyCam.dll not found`: build the `SonyCam` target and copy it into `Release/`.
+- `API version ... does not match`: rebuild `SonyCam.dll` from the matching Sony_SDK branch.
+- `no camera found`: camera powered on, USB connected, and not held by another program
+  (close `RemoteCli.exe` / Imaging Edge).
+- Check the session log for `[SonyCam]` lines.
 
-**No latest image shows**
-- Ensure new files are named `DSCxxxxx.JPG` (case-insensitive) in `DEFAULT_IMAGE_DIR`.
+**Images are not renamed / no latest image**
+- Set **Save to** to **PC** or **PC + Camera**; with **Camera** the files never reach the PC.
+- Images land in the **Image folder** shown in the Sony Camera panel.
 
 **Altimeter stuck on “no data”**
 - Verify connection mode and COM/IP.
