@@ -10,7 +10,8 @@ output, the GUI calls the camera directly:
     cam.load()                       # load the DLL + init the Sony SDK
     cam.connect()                    # first camera found
     cam.set_save_folder("C:/images")
-    cam.capture()                    # on_image(path) fires when the file lands
+    cam.capture()                    # on_capture() fires once the camera has saved it
+                                     # on_image(path) fires if it is also sent to the PC
     jpeg = cam.get_live_view()       # bytes, or None if no new frame
 
 All methods block until the camera answers, so call them from a worker
@@ -24,7 +25,7 @@ import sys
 import threading
 from pathlib import Path
 
-API_VERSION = 1
+API_VERSION = 2
 
 OK = 0
 _ERRORS = {
@@ -49,7 +50,9 @@ SETTING_FOCUS_MODE = 4
 STORE_DESTINATIONS = ("PC", "Camera", "PC + Camera")
 
 _TEXT_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p)
-_NO_CALLBACK = _TEXT_CALLBACK()  # NULL function pointer
+_EVENT_CALLBACK = ctypes.CFUNCTYPE(None)
+_NO_CALLBACK = _TEXT_CALLBACK()  # NULL function pointers
+_NO_EVENT_CALLBACK = _EVENT_CALLBACK()
 
 _LIVE_VIEW_START_BYTES = 2 * 1024 * 1024
 _LIVE_VIEW_MAX_BYTES = 32 * 1024 * 1024
@@ -86,21 +89,25 @@ def _working_dir(path):
 
 
 class SonyCamera:
-    def __init__(self, lib_dir, on_log=None, on_image=None):
+    def __init__(self, lib_dir, on_log=None, on_image=None, on_capture=None):
         """
-        lib_dir:  folder holding SonyCam.dll, Cr_Core.dll and CrAdapter/.
-        on_log:   called with each line the camera code logs.
-        on_image: called with the full path of each image saved on the PC.
+        lib_dir:    folder holding SonyCam.dll, Cr_Core.dll and CrAdapter/.
+        on_log:     called with each line the camera code logs.
+        on_image:   called with the full path of each image saved on the PC.
+        on_capture: called (no arguments) each time the camera has saved a
+                    shot to its own memory, whatever the store destination.
         """
         self.lib_dir = Path(lib_dir)
         self.on_log = on_log
         self.on_image = on_image
+        self.on_capture = on_capture
         self._lib = None
         self._dll_dir_handle = None
         self._lv_buf = None
         # ctypes callbacks must stay referenced while the DLL may call them
         self._log_cb = _TEXT_CALLBACK(self._handle_log)
         self._image_cb = _TEXT_CALLBACK(self._handle_image)
+        self._capture_cb = _EVENT_CALLBACK(self._handle_capture)
 
     # ---------- callbacks (SDK threads) ----------
     def _handle_log(self, raw):
@@ -114,6 +121,13 @@ class SonyCamera:
         if self.on_image is not None and raw:
             try:
                 self.on_image(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+
+    def _handle_capture(self):
+        if self.on_capture is not None:
+            try:
+                self.on_capture()
             except Exception:
                 pass
 
@@ -151,11 +165,13 @@ class SonyCamera:
             )
         lib.sonycam_set_log_callback(self._log_cb)
         lib.sonycam_set_download_callback(self._image_cb)
+        lib.sonycam_set_capture_callback(self._capture_cb)
         with _working_dir(self.lib_dir):
             rc = lib.sonycam_init()
         if rc != OK:
             lib.sonycam_set_log_callback(_NO_CALLBACK)
             lib.sonycam_set_download_callback(_NO_CALLBACK)
+            lib.sonycam_set_capture_callback(_NO_EVENT_CALLBACK)
             raise SonyCameraError("SDK init", rc)
         self._lib = lib
 
@@ -166,6 +182,7 @@ class SonyCamera:
             "sonycam_api_version": ([], c_int),
             "sonycam_set_log_callback": ([_TEXT_CALLBACK], None),
             "sonycam_set_download_callback": ([_TEXT_CALLBACK], None),
+            "sonycam_set_capture_callback": ([_EVENT_CALLBACK], None),
             "sonycam_init": ([], c_int),
             "sonycam_shutdown": ([], None),
             "sonycam_connect": ([c_int, c_int], c_int),
@@ -196,6 +213,7 @@ class SonyCamera:
         finally:
             lib.sonycam_set_log_callback(_NO_CALLBACK)
             lib.sonycam_set_download_callback(_NO_CALLBACK)
+            lib.sonycam_set_capture_callback(_NO_EVENT_CALLBACK)
 
     def _api(self):
         if self._lib is None:

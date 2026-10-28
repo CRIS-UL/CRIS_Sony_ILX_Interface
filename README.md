@@ -32,7 +32,7 @@ A Windows-oriented Python/Tkinter application to control an **Aquorea Mk3** stro
 - **Strobe/Lamp control** via TCP commands (intensity 0–100)  
 - **Trigger loop** (ms hold & interval) with safety prompts  
 - **Sony SDK integration (in-process)**: the GUI loads `SonyCam.dll` and calls the camera directly: connect, capture, live view, store destination, mode/shutter/aperture/ISO/focus  
-- **Automatic image renaming**: every image the camera saves to the PC is renamed with a prefix, timestamp and seabed altitude, and logged to `image_log.csv`  
+- **Shot log + image renaming**: every shot the camera saves to its card is logged live (time, seabed altitude, lights, settings) without sending images up the tether; **Rename Card Images...** renames the files after the dive  
 - **Live View panel** (frames straight from the camera, no temp files)  
 - **Latest Image** window that shows the last image the camera saved  
 - Legacy **Show Camera GUI** button still launches `RemoteCli.exe 1` (the OpenCV camera GUI)  
@@ -185,7 +185,7 @@ black box.
   - **Connect Camera**: loads the DLL, connects to the first camera and starts live view.
   - **Capture**: fires the shutter from the PC (hardware triggers from the Arduino still work as before).
   - **Save to**: the camera's still image store destination (PC / Camera / PC + Camera).
-    Images are only renamed when they reach the PC, so use **PC** or **PC + Camera**.
+    **Camera** keeps images on the card so nothing large goes up the ROV tether.
   - **Mode / Shutter / Aperture / ISO / Focus**: read from the camera on connect, and set
     when you pick a value (greyed out when the camera won't allow a change, e.g. the dial
     position decides). **Refresh** re-reads them.
@@ -195,19 +195,39 @@ black box.
 
 ### Image naming
 
-When the camera finishes transferring an image to the PC, the SDK reports its path
-(`OnCompleteDownload`) and the GUI immediately renames it in the **Image folder**:
+**Saving to the camera card (normal for the ROV).** Each time the camera has saved a
+shot, it sends a tiny capture event (no image data) and the GUI adds a row to
+`shot_log_<session>.csv` in the **Image folder**:
+`shot, time, seabed_alt_m, strobe_intensity, lamp_intensity, mode, shutter, aperture, iso, focus`.
+The panel shows the running shot count.
+
+After the dive, copy that dive's images off the card into a folder and press
+**Rename Card Images...** (pick the folder, then the shot log). It previews the renames and
+asks before changing anything. From a terminal:
+
+```
+python card_rename.py <image folder> <shot_log.csv> --prefix DIVE01 --dry-run
+```
+
+Files are renamed using the shot's PC time and altitude:
 
 ```
 <prefix>_<YYYYmmdd_HHMMSS_mmm>_alt<seabed alt>m_<camera name>.<ext>
-e.g.  DIVE-01_20261028_142233_517_alt1.23m_DSC01234.JPG
+e.g.  DIVE01_20261028_142233_517_alt1.23m_DSC01234.JPG
 ```
 
-- The timestamp is the PC clock when the file arrived (a fraction of a second after the shot).
-- RAW + JPEG from the same shot get the same timestamp, so they stay paired.
-- Untick **Rename** to keep the camera's names; untick **Add seabed alt** to leave the altitude out.
-- Every image (renamed or not) gets a row in `image_log.csv` in the image folder:
-  `saved_at, file, camera_file, seabed_alt_m, strobe_intensity, lamp_intensity, mode, shutter, aperture, iso, focus`.
+- The camera sends exactly one event per saved shot, so if the folder holds the same
+  number of shots as the log they are paired in order. Copy only that dive's images for
+  this exact match.
+- Otherwise each image's EXIF capture time is lined up with the log (the camera clock does
+  not need to match the PC clock). Images that don't line up, such as shots from before the
+  session, are left unchanged and listed.
+- RAW + JPEG of one shot keep the same new name. Each rename is added to `image_log.csv`.
+- The time is when the GUI received the capture event, a fraction of a second after the shot.
+- Not reported by ILCE-9M2, ILCE-7RM4, ILME-FX6, MPC-2610, PXW-Z200 or HXR-NX800 (Sony SDK limitation).
+
+**Saving to the PC (PC / PC + Camera).** Images that reach the PC are renamed straight away
+in the same format (untick **Rename** to keep the camera's names) and logged to `image_log.csv`.
 
 ### Live View
 
@@ -268,9 +288,12 @@ pyinstaller --onefile --windowed --name CRIS_Sony_ILX_Interface --icon "app.ico"
   (close `RemoteCli.exe` / Imaging Edge).
 - Check the session log for `[SonyCam]` lines.
 
-**Images are not renamed / no latest image**
-- Set **Save to** to **PC** or **PC + Camera**; with **Camera** the files never reach the PC.
-- Images land in the **Image folder** shown in the Sony Camera panel.
+**Shot count stays at 0**
+- The capture event needs a connected camera (**Connect Camera**) and a model that reports it (see Image naming).
+
+**Rename Card Images leaves files unmatched**
+- Make sure the shot log is from the same dive, and copy only that dive's images.
+- JPEGs are matched by their EXIF time; RAW files follow the JPEG with the same name.
 
 **Altimeter stuck on “no data”**
 - Verify connection mode and COM/IP.

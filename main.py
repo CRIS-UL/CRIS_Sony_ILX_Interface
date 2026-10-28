@@ -23,6 +23,7 @@ from io import BytesIO
 # --- Sony camera, called in-process through SonyCam.dll ---
 import sony_camera
 from sony_camera import SonyCamera, SonyCameraError
+import card_rename
 
 # --- pymavlink for direct seabed altitude probing ---
 try:
@@ -79,7 +80,8 @@ _RELEASE_DIR = get_app_dir() / "Release"
 SONYCAM_LIB_DIR = str(_RELEASE_DIR)
 # Default folder the camera's PC copies are saved (and renamed) in; changeable in the GUI
 DEFAULT_IMAGE_DIR = str(get_app_dir() / "images")
-IMAGE_LOG_FILENAME = "image_log.csv"  # one row per saved image, in the save folder
+IMAGE_LOG_FILENAME = card_rename.IMAGE_LOG_FILENAME  # one row per renamed image, in its folder
+SHOT_LOG_PREFIX = "shot_log_"  # shot_log_<session>.csv: one row per shot the camera saves
 CAMERA_CONNECT_TIMEOUT_MS = 10000
 
 # Legacy: the standalone RemoteCli.exe camera GUI ("Show Camera GUI" button)
@@ -314,6 +316,7 @@ class App(tk.Tk):
         logs_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.run_log_path = logs_dir / f"session_log_{ts}.txt"
+        self._session_ts = ts
 
         root = ttk.Frame(self, padding=10)
         root.pack(fill="both", expand=True)
@@ -443,6 +446,8 @@ class App(tk.Tk):
         ttk.Entry(name_row, textvariable=self.img_prefix_var, width=12).pack(side="left", padx=4)
         self.img_alt_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(name_row, text="Add seabed alt", variable=self.img_alt_var).pack(side="left", padx=4)
+        ttk.Button(name_row, text="Rename Card Images...",
+                   command=self.rename_card_images).pack(side="left", padx=(12, 0))
 
         # BlueROV state defaults — always initialised so the rest of the app
         # (e.g. on_close) is safe whether or not the controls are enabled.
@@ -643,7 +648,9 @@ class App(tk.Tk):
             on_log=lambda line: self._cam_events.put(("log", line)),
             on_image=lambda path: self._cam_events.put(
                 ("image", path, datetime.datetime.now())),
+            on_capture=lambda: self._cam_events.put(("shot", datetime.datetime.now())),
         )
+        self._shot_count = 0
         self._cam_busy = False            # connect/disconnect in progress
         self._cam_connected = False
         self._lv_thread = None
@@ -1127,6 +1134,10 @@ class App(tk.Tk):
                     self.append_log(f"[SonyCam] {ev[1]}")
                 elif kind == "image":
                     self._handle_new_image(ev[1], ev[2])
+                elif kind == "shot":
+                    self._handle_shot(ev[1])
+                elif kind == "call":
+                    ev[1]()
                 elif kind == "connected":
                     _, model, dest = ev
                     self._cam_busy = False
@@ -1135,8 +1146,9 @@ class App(tk.Tk):
                     if dest is not None and 0 <= dest < len(sony_camera.STORE_DESTINATIONS):
                         self.store_dest_combo.current(dest)
                         if dest == 1:
-                            self.append_log("[SonyCam] Store destination is Camera only: "
-                                            "images will not reach the PC to be renamed")
+                            self.append_log(f"[SonyCam] Saving to the camera card; shots are logged to "
+                                            f"{self._shot_log_path()} - use 'Rename Card Images...' "
+                                            f"after copying them off the card")
                     self.append_log(f"[SonyCam] Connected to {model}")
                 elif kind == "connect_failed":
                     self._cam_busy = False
@@ -1182,13 +1194,90 @@ class App(tk.Tk):
             writable = self._setting_writable.get(kind, False)
             combo.config(state=("readonly" if connected and writable else "disabled"))
 
-    # Saved images: rename with timestamp (+ seabed altitude) and log to CSV
+    def _current_shot_meta(self, when):
+        """Altitude, light levels and camera settings at the moment of a shot."""
+        with self._seabed_alt_lock:
+            alt = self._seabed_alt
+        meta = {
+            "time": when.isoformat(timespec="milliseconds"),
+            "seabed_alt_m": "" if alt is None else f"{alt:.3f}",
+            "strobe_intensity": self.lbl_strobe.cget("text"),
+            "lamp_intensity": self.lbl_lamp.cget("text"),
+        }
+        for kind, label in CAMERA_SETTINGS:
+            meta[label.lower()] = self.setting_combos[kind].get()
+        return meta, alt
+
+    def _shot_log_path(self):
+        folder = Path(self.save_dir_var.get().strip() or DEFAULT_IMAGE_DIR)
+        return folder / f"{SHOT_LOG_PREFIX}{self._session_ts}.csv"
+
+    # Shots saved on the camera card: log each one so the files can be
+    # renamed after the dive (see card_rename.py)
+    def _handle_shot(self, when):
+        self._shot_count += 1
+        meta, _alt = self._current_shot_meta(when)
+        meta["shot"] = self._shot_count
+        path = self._shot_log_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            card_rename.append_csv(path, card_rename.SHOT_LOG_FIELDS, meta)
+        except Exception as e:
+            self.append_log(f"[SonyCam] Could not write {path}: {e}")
+        self.last_image_var.set(f"Shots: {self._shot_count}")
+        self.append_log(f"[SonyCam] Shot {self._shot_count} saved by camera "
+                        f"(alt {meta['seabed_alt_m'] or '--'} m)")
+
+    def rename_card_images(self):
+        """Match images copied off the card to a shot log and rename them."""
+        folder = filedialog.askdirectory(title="Folder of images copied off the camera card",
+                                         initialdir=self.save_dir_var.get() or DEFAULT_IMAGE_DIR)
+        if not folder:
+            return
+        log_dir = Path(self.save_dir_var.get() or DEFAULT_IMAGE_DIR)
+        logs = sorted(log_dir.glob(f"{SHOT_LOG_PREFIX}*.csv"), key=lambda p: p.stat().st_mtime)
+        shot_log = filedialog.askopenfilename(
+            title="Shot log for these images",
+            initialdir=str(log_dir),
+            initialfile=logs[-1].name if logs else "",
+            filetypes=[("Shot log", f"{SHOT_LOG_PREFIX}*.csv"), ("CSV", "*.csv")])
+        if not shot_log:
+            return
+        prefix, add_alt = self.img_prefix_var.get(), self.img_alt_var.get()
+
+        def plan():
+            try:
+                result = card_rename.plan_renames(folder, shot_log, prefix, add_alt)
+            except Exception as e:
+                self._cam_events.put(("log", f"Rename card images failed: {e}"))
+                return
+            self._cam_events.put(("call", lambda: self._confirm_card_renames(folder, *result)))
+        threading.Thread(target=plan, daemon=True, name="CardRename-Plan").start()
+
+    def _confirm_card_renames(self, folder, renames, unmatched, how):
+        if not renames:
+            messagebox.showinfo("Rename card images", f"No images could be matched ({how}).")
+            return
+        examples = "\n".join(f"{s.name} -> {d.name}" for s, d, _ in renames[:3])
+        msg = (f"{how}.\n\nRename {len(renames)} files?"
+               f"{f'  ({len(unmatched)} images left unmatched)' if unmatched else ''}"
+               f"\n\n{examples}{chr(10) + '...' if len(renames) > 3 else ''}")
+        if not messagebox.askyesno("Rename card images", msg):
+            return
+
+        def apply():
+            errors = card_rename.apply_renames(folder, renames)
+            for e in errors:
+                self._cam_events.put(("log", f"Rename: {e}"))
+            self._cam_events.put(("log", f"Renamed {len(renames) - len(errors)} card images in {folder}"))
+        threading.Thread(target=apply, daemon=True, name="CardRename-Apply").start()
+
+    # Images sent to the PC: rename with timestamp (+ seabed altitude) and log to CSV
     def _handle_new_image(self, path, arrived):
         src = Path(path)
         if not src.is_absolute():
             src = Path(self.save_dir_var.get() or DEFAULT_IMAGE_DIR) / src
-        with self._seabed_alt_lock:
-            alt = self._seabed_alt
+        meta, alt = self._current_shot_meta(arrived)
 
         # RAW+JPEG arrive as two files with the same camera name: give both
         # the same timestamp/altitude so they stay paired after renaming.
@@ -1201,35 +1290,15 @@ class App(tk.Tk):
         else:
             self._recent_image_names[stem] = (arrived, alt, now)
 
-        meta = {
-            "saved_at": arrived.isoformat(timespec="milliseconds"),
-            "camera_file": src.name,
-            "seabed_alt_m": "" if alt is None else f"{alt:.3f}",
-            "strobe_intensity": self.lbl_strobe.cget("text"),
-            "lamp_intensity": self.lbl_lamp.cget("text"),
-        }
-        for kind, label in CAMERA_SETTINGS:
-            meta[label.lower()] = self.setting_combos[kind].get()
+        meta["camera_file"] = src.name
+        meta["shot"] = self._shot_count
 
-        dest = self._build_image_path(src, arrived, alt) if self.img_rename_var.get() else src
+        if self.img_rename_var.get():
+            dest = card_rename.build_image_name(src, arrived, alt, self.img_prefix_var.get(),
+                                                self.img_alt_var.get())
+        else:
+            dest = src
         self._rename_image(src, dest, meta, attempt=0)
-
-    def _build_image_path(self, src, when, alt):
-        """<prefix>_<YYYYmmdd_HHMMSS_mmm>[_alt<x.xx>m]_<camera name>.<ext>"""
-        parts = []
-        prefix = re.sub(r"[^A-Za-z0-9._-]+", "-", self.img_prefix_var.get().strip()).strip("-")
-        if prefix:
-            parts.append(prefix)
-        parts.append(when.strftime("%Y%m%d_%H%M%S_") + f"{when.microsecond // 1000:03d}")
-        if self.img_alt_var.get() and alt is not None:
-            parts.append(f"alt{alt:.2f}m")
-        parts.append(src.stem)
-        dest = src.with_name("_".join(parts) + src.suffix)
-        n = 1
-        while dest.exists():
-            dest = src.with_name("_".join(parts) + f"_{n}" + src.suffix)
-            n += 1
-        return dest
 
     def _rename_image(self, src, dest, meta, attempt):
         if dest != src:
@@ -1249,16 +1318,9 @@ class App(tk.Tk):
         self.append_log(f"[SonyCam] Saved {meta['camera_file']} -> {dest}")
 
     def _append_image_log(self, folder, meta):
-        fields = ["saved_at", "file", "camera_file", "seabed_alt_m",
-                  "strobe_intensity", "lamp_intensity"] + [label.lower() for _k, label in CAMERA_SETTINGS]
         path = Path(folder) / IMAGE_LOG_FILENAME
         try:
-            new_file = not path.exists()
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-                if new_file:
-                    w.writeheader()
-                w.writerow(meta)
+            card_rename.append_csv(path, ["file", "camera_file"] + card_rename.SHOT_LOG_FIELDS, meta)
         except Exception as e:
             self.append_log(f"[SonyCam] Could not write {path}: {e}")
 
